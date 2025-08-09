@@ -1,0 +1,8 @@
+what shape is this|this is a {{ shape }}
+what do you see|i see a {{ shape }}
+is this a {{ shape }}|yes
+is this a {{ random_other_shape }}|no
+can you see a {{ shape }}|yes i can
+can you see a {{ random_other_shape }}|no
+is there a {{ shape }} in the image|yes there is
+is there a {{ random_other_shape }} in the image|not that i can see
