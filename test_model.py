@@ -49,7 +49,7 @@ class ToyVLMGUI:
         # Initialize GUI
         self.root = tk.Tk()
         self.root.title("Toy Vision-Language Model")
-        self.root.geometry("800x600")
+        self.root.geometry("800x500")
         self.setup_gui()
         
         # Generate initial shape
@@ -74,16 +74,12 @@ class ToyVLMGUI:
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         
-        # Editing controls
-        edit_frame = ttk.LabelFrame(left_frame, text="Image Editor", padding=5)
-        edit_frame.pack(fill=tk.X, pady=5)
-        
-        # Tool buttons
-        tools_frame = ttk.Frame(edit_frame)
-        tools_frame.pack(fill=tk.X, pady=(0, 5))
+        # # Tool buttons
+        edit_frame = ttk.Frame(left_frame)
+        edit_frame.pack(fill=tk.X, pady=(0, 5))
         
         # Shape selection radio buttons
-        shapes_frame = ttk.Frame(tools_frame)
+        shapes_frame = ttk.Frame(edit_frame)        
         shapes_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
         
         self.tool_var = tk.StringVar(value='square')
@@ -91,20 +87,14 @@ class ToyVLMGUI:
                        value='square', command=self.on_tool_change).pack(side=tk.LEFT, padx=5)
         ttk.Radiobutton(shapes_frame, text="Circle", variable=self.tool_var, 
                        value='circle', command=self.on_tool_change).pack(side=tk.LEFT, padx=5)
-        
-        # Erase mode checkbox
-        erase_frame = ttk.Frame(tools_frame)
-        erase_frame.pack(side=tk.TOP, fill=tk.X)
-        
         self.erase_var = tk.BooleanVar()
-        ttk.Checkbutton(erase_frame, text="Erase Mode", variable=self.erase_var, 
-                       command=self.on_erase_change).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(shapes_frame, text="Erase Mode", variable=self.erase_var, 
+                       command=self.on_erase_change).pack(side=tk.RIGHT, padx=5)
         
         # Size slider
         size_frame = ttk.Frame(edit_frame)
         size_frame.pack(fill=tk.X, pady=(5, 0))
         
-        ttk.Label(size_frame, text="Tool Size:").pack(side=tk.LEFT)
         self.size_var = tk.IntVar(value=10)
         self.size_slider = ttk.Scale(size_frame, from_=5, to=30, orient=tk.HORIZONTAL, 
                                     variable=self.size_var, command=self.on_size_change)
@@ -114,30 +104,35 @@ class ToyVLMGUI:
         self.size_label.pack(side=tk.LEFT)
         
         # Generate new shape button
-        ttk.Button(left_frame, text="New Shape", command=self.generate_new_shape).pack(pady=5)
+        ttk.Button(edit_frame, text="New Shape", command=self.generate_new_shape).pack(pady=5, side=tk.LEFT)
+
                 
         # Right panel for chat
         right_frame = ttk.Frame(main_frame)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         
         # Chat history
-        ttk.Label(right_frame, text="Chat Session").pack(anchor='w', pady=(0, 5))
         self.chat_display = scrolledtext.ScrolledText(right_frame, height=20, wrap=tk.WORD, state='disabled')
         self.chat_display.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
         # Question input
         input_frame = ttk.Frame(right_frame)
         input_frame.pack(fill=tk.X, pady=(0, 5))
-        
+
         ttk.Label(input_frame, text="Ask a question:").pack(anchor='w')
-        self.question_entry = ttk.Entry(input_frame)
-        self.question_entry.pack(fill=tk.X, pady=(5, 10))
+
+        # Entry and button in the same row
+        entry_button_frame = ttk.Frame(input_frame)
+        entry_button_frame.pack(fill=tk.X, pady=(5, 10))
+
+        self.question_entry = ttk.Entry(entry_button_frame)
+        self.question_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         self.question_entry.bind('<Return>', self.on_enter_pressed)
         self.question_entry.bind('<Up>', self.on_up_key)
         self.question_entry.bind('<Down>', self.on_down_key)
-        
+
         # Send button
-        ttk.Button(input_frame, text="Ask Question", command=self.ask_question).pack()
+        ttk.Button(entry_button_frame, text="Ask Question", command=self.ask_question).pack(side=tk.RIGHT)
         
         # Add initial welcome message
         self.add_to_chat("Ask me what I can see in the image", "System")
@@ -164,7 +159,7 @@ class ToyVLMGUI:
         self.update_canvas_display()
         
         # Add to chat
-        self.add_to_chat(f"Generated a new {self.current_shape_type}!", "System")
+        # self.add_to_chat(f"Generated a new {self.current_shape_type}!", "System")
     
     def update_canvas_display(self):
         """Update the canvas with the current image."""
