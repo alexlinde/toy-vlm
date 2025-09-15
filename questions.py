@@ -4,7 +4,7 @@ Handles creation of questions and answers about geometric shapes using Jinja tem
 """
 
 import random
-from typing import List, Tuple
+from typing import Tuple
 from jinja2 import Environment, BaseLoader
 from shapes import ShapeGenerator
 

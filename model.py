@@ -10,9 +10,13 @@ import numpy as np
 import math
 from text import MAX_SEQ_LEN, TextProcessor
 
-# Model constants
-DEVICE = torch.device('mps')
-IMAGE_SIZE = 64
+# Model constants - device fallback
+if torch.backends.mps.is_available():
+    DEVICE = torch.device('mps')
+elif torch.cuda.is_available():
+    DEVICE = torch.device('cuda')
+else:
+    DEVICE = torch.device('cpu')
 HIDDEN_DIM = 256
 NUM_HEADS = 4
 NUM_LAYERS = 4

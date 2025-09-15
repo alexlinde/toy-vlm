@@ -8,7 +8,7 @@ import numpy as np
 import os
 import tkinter as tk
 from tkinter import ttk, scrolledtext
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 import threading
 
 from shapes import ShapeGenerator
@@ -40,6 +40,13 @@ class ToyVLMGUI:
         self.question_history = []
         self.history_index = -1
         
+        # Image editing state
+        self.editing_mode = 'square'  # 'square', 'circle'
+        self.erase_mode = False
+        self.tool_size = 10
+        self.canvas_scale = 300  # Scale factor from 64x64 to display size
+        self.is_drawing = False
+        
         # Initialize GUI
         self.root = tk.Tk()
         self.root.title("Toy Vision-Language Model")
@@ -59,9 +66,53 @@ class ToyVLMGUI:
         left_frame = ttk.Frame(main_frame)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 10))
         
-        # Image display
-        self.image_label = ttk.Label(left_frame, text="Loading image...", anchor='center')
-        self.image_label.pack(pady=10)
+        # Image display (using Canvas for editing)
+        self.canvas = tk.Canvas(left_frame, width=self.canvas_scale, height=self.canvas_scale, bg='black', highlightthickness=1)
+        self.canvas.pack(pady=10)
+        
+        # Bind mouse events for drawing
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+        
+        # Editing controls
+        edit_frame = ttk.LabelFrame(left_frame, text="Image Editor", padding=5)
+        edit_frame.pack(fill=tk.X, pady=5)
+        
+        # Tool buttons
+        tools_frame = ttk.Frame(edit_frame)
+        tools_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        # Shape selection radio buttons
+        shapes_frame = ttk.Frame(tools_frame)
+        shapes_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
+        
+        self.tool_var = tk.StringVar(value='square')
+        ttk.Radiobutton(shapes_frame, text="Square", variable=self.tool_var, 
+                       value='square', command=self.on_tool_change).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(shapes_frame, text="Circle", variable=self.tool_var, 
+                       value='circle', command=self.on_tool_change).pack(side=tk.LEFT, padx=5)
+        
+        # Erase mode checkbox
+        erase_frame = ttk.Frame(tools_frame)
+        erase_frame.pack(side=tk.TOP, fill=tk.X)
+        
+        self.erase_var = tk.BooleanVar()
+        ttk.Checkbutton(erase_frame, text="Erase Mode", variable=self.erase_var, 
+                       command=self.on_erase_change).pack(side=tk.LEFT, padx=5)
+        
+        # Size slider
+        size_frame = ttk.Frame(edit_frame)
+        size_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        ttk.Label(size_frame, text="Tool Size:").pack(side=tk.LEFT)
+        self.size_var = tk.IntVar(value=10)
+        self.size_slider = ttk.Scale(size_frame, from_=5, to=30, orient=tk.HORIZONTAL, 
+                                    variable=self.size_var, command=self.on_size_change)
+        self.size_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 10))
+        
+        self.size_label = ttk.Label(size_frame, text="10")
+        self.size_label.pack(side=tk.LEFT)
         
         # Generate new shape button
         ttk.Button(left_frame, text="New Shape", command=self.generate_new_shape).pack(pady=5)
@@ -90,7 +141,7 @@ class ToyVLMGUI:
         ttk.Button(input_frame, text="Ask Question", command=self.ask_question).pack()
         
         # Add initial welcome message
-        # self.add_to_chat("Generate a shape and ask questions about it.", "System")
+        self.add_to_chat("Generate a shape and ask questions about it.", "System")
         
         # Give focus to question entry
         self.question_entry.focus_set()
@@ -110,19 +161,25 @@ class ToyVLMGUI:
     
     def generate_new_shape(self):
         """Generate a new random shape and update the display."""
-        self.current_shape_type, self.current_image = self.shape_generator.generate_random_shape()
-        
-        # Convert numpy array to PIL Image and then to PhotoImage
-        # Scale up the image for better visibility
-        img_array = (self.current_image * 255).astype(np.uint8)
-        pil_img = Image.fromarray(img_array)
-        pil_img = pil_img.resize((300, 300), Image.NEAREST)  # Scale up with nearest neighbor
-        
-        self.photo = ImageTk.PhotoImage(pil_img)
-        self.image_label.config(image=self.photo, text="")
+        self.current_shape_type, self.current_image = self.shape_generator.generate_random_shape(add_noise=False)
+        self.update_canvas_display()
         
         # Add to chat
         self.add_to_chat(f"Generated a new {self.current_shape_type}!", "System")
+    
+    def update_canvas_display(self):
+        """Update the canvas with the current image."""
+        # Convert numpy array to PIL Image and then to PhotoImage
+        img_array = (self.current_image * 255).astype(np.uint8)
+        pil_img = Image.fromarray(img_array)
+        self.img_size = pil_img.size
+        pil_img = pil_img.resize((self.canvas_scale, self.canvas_scale), Image.NEAREST)  # Scale up with nearest neighbor
+        
+        self.photo = ImageTk.PhotoImage(pil_img)
+        
+        # Clear canvas and display image
+        self.canvas.delete("all")
+        self.canvas.create_image(150, 150, image=self.photo, anchor='center')
         
     def on_enter_pressed(self, event):
         """Handle Enter key press in question entry."""
@@ -185,6 +242,62 @@ class ToyVLMGUI:
         
         # Update GUI in main thread
         self.root.after(0, self.add_to_chat, response, "VLM")
+    
+    def on_tool_change(self):
+        """Handle tool selection change."""
+        self.editing_mode = self.tool_var.get()
+    
+    def on_erase_change(self):
+        """Handle erase mode checkbox change."""
+        self.erase_mode = self.erase_var.get()
+    
+    def on_size_change(self, value):
+        """Handle size slider change."""
+        self.tool_size = int(float(value))
+        self.size_label.config(text=str(self.tool_size))
+    
+    def on_canvas_click(self, event):
+        """Handle mouse click on canvas."""
+        self.is_drawing = True
+        self.draw_at_position(event.x, event.y)
+    
+    def on_canvas_drag(self, event):
+        """Handle mouse drag on canvas."""
+        if self.is_drawing:
+            self.draw_at_position(event.x, event.y)
+    
+    def on_canvas_release(self, event):
+        """Handle mouse release on canvas."""
+        _ = event  # Unused parameter
+        self.is_drawing = False
+    
+    def draw_at_position(self, canvas_x, canvas_y):
+        """Draw at the specified canvas position."""
+        # Convert canvas coordinates to image coordinates (300x300 -> 64x64)
+        img_x = int(canvas_x * self.img_size[0] / self.canvas_scale)
+        img_y = int(canvas_y * self.img_size[1] / self.canvas_scale)
+        
+        # Ensure coordinates are within bounds
+        if 0 <= img_x < self.img_size[0] and 0 <= img_y < self.img_size[1]:
+            self.draw_shape(self.editing_mode, img_x, img_y, self.tool_size, 0 if self.erase_mode else 255)
+            self.update_canvas_display()
+    
+    def draw_shape(self, shape_type, center_x, center_y, size, fill_color):
+        """Draw or erase a shape at the specified position using Pillow."""
+        # Convert numpy array to PIL Image
+        pil_img = Image.fromarray((self.current_image * 255).astype(np.uint8))
+        draw = ImageDraw.Draw(pil_img)
+        half_size = size // 2
+        x1 = center_x - half_size; y1 = center_y - half_size;
+        x2 = center_x + half_size; y2 = center_y + half_size;
+        
+        if shape_type == 'square':
+            draw.rectangle([x1, y1, x2, y2], fill=fill_color)            
+        elif shape_type == 'circle':
+            draw.ellipse([x1, y1, x2, y2], fill=fill_color)
+        
+        # Convert back to numpy array
+        self.current_image = np.array(pil_img, dtype=np.float32) / 255.0
     
     def run(self):
         """Start the GUI."""

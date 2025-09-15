@@ -30,16 +30,11 @@ This is a toy Vision-Language Model (VLM) implementation in PyTorch that demonst
   
 - **ShapeGenerator**: Synthetic dataset creation
   - 5 shape types: square, circle, rectangle, cross, triangle
-  - Random positioning, sizing, and noise injection
+  - Random positioning, sizing, rotation, and noise injection
   
 - **QuestionGenerator**: Template-based Q&A generation
   - Uses `questions.txt` with basic question templates
   - Jinja2 templates support shape identification and yes/no questions
-
-## Hardware Configuration
-
-- **Device**: Hardcoded to Apple Silicon MPS (`torch.device('mps')`)
-- **Warning**: No automatic fallback to CPU/CUDA if MPS unavailable
 
 ## Model Configuration
 
@@ -47,7 +42,7 @@ Current hyperparameters:
 - Image size: 64x64 pixels
 - Hidden dimension: 256
 - Transformer: 4 layers, 4 attention heads  
-- Max sequence length: 20 tokens (reduced from 50)
+- Max sequence length: 20 tokens
 - Batch size: 25
 - Training epochs: 5
 - Learning rate: 1e-3
@@ -90,7 +85,6 @@ See `requirements.txt` for the complete list of dependencies:
 
 ## Known Limitations
 
-1. **Limited question variety**: Only a few basic templates in questions.txt
+1. **Limited question variety**: Only 6 basic templates in questions.txt
 2. **Simple vocabulary**: Vocab may need expansion for complex questions
-3. **No device fallback**: MPS hardcoding prevents running on other systems
 5. **Sequence length**: 20 tokens may be limiting for longer conversations
