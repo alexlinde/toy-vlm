@@ -12,8 +12,8 @@ This is a toy Vision-Language Model (VLM) implementation in PyTorch that demonst
 - **text.py**: Text processing with StandardTokenizer using transformers
 - **shapes.py**: Geometric shape generation for synthetic data
 - **questions.py**: Jinja2-based question template system
-- **vlm-generate.py**: Training script with dataset generation
-- **vlm-execute.py**: Interactive GUI for model inference
+- **train_model.py**: Training script with dataset generation
+- **test_model.py**: Interactive GUI for model inference
 
 ## Key Architecture Components
 
@@ -58,13 +58,13 @@ pip install -r requirements.txt
 
 ### Training
 ```bash
-python vlm-generate.py
+python train_model.py
 ```
 This will train the model and save it as `toy_vlm.pth` along with the vocabulary.
 
 ### Interactive GUI
 ```bash
-python vlm-execute.py
+python test_model.py
 ```
 Launches a Tkinter GUI for visual interaction with the trained model.
 

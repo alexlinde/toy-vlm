@@ -12,7 +12,6 @@ from PIL import Image, ImageTk, ImageDraw
 import threading
 
 from shapes import ShapeGenerator
-# from questions import QuestionGenerator
 from text import SimpleTokenizer, TextProcessor
 from model import ToyVLM, DEVICE, generate_response
 
@@ -141,7 +140,7 @@ class ToyVLMGUI:
         ttk.Button(input_frame, text="Ask Question", command=self.ask_question).pack()
         
         # Add initial welcome message
-        self.add_to_chat("Generate a shape and ask questions about it.", "System")
+        self.add_to_chat("Ask me what I can see in the image", "System")
         
         # Give focus to question entry
         self.question_entry.focus_set()
