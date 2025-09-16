@@ -94,31 +94,74 @@ class MultiHeadAttention(nn.Module):
         output = self.W_o(context)
         return output
 
-class TransformerBlock(nn.Module):
-    """Transformer decoder block."""
-    
+class CrossAttention(nn.Module):
+    """Cross-attention mechanism for text attending to vision features."""
+
     def __init__(self, d_model, num_heads):
         super().__init__()
-        self.attention = MultiHeadAttention(d_model, num_heads)
+        assert d_model % num_heads == 0
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+    def forward(self, query, memory):
+        batch_size = query.size(0)
+
+        # Linear transformations and reshape
+        Q = self.W_q(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        K = self.W_k(memory).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        V = self.W_v(memory).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+
+        # Attention (no masking for cross-attention)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        attention = F.softmax(scores, dim=-1)
+        context = torch.matmul(attention, V)
+
+        # Concatenate heads
+        context = context.transpose(1, 2).contiguous().view(
+            batch_size, -1, self.d_model
+        )
+
+        output = self.W_o(context)
+        return output
+
+class TransformerBlock(nn.Module):
+    """Transformer decoder block with cross-attention to vision features."""
+
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        self.self_attention = MultiHeadAttention(d_model, num_heads)
+        self.cross_attention = CrossAttention(d_model, num_heads)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        
+        self.norm3 = nn.LayerNorm(d_model)
+
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.ReLU(),
             nn.Linear(d_model * 4, d_model),
             nn.Dropout(0.1)
         )
-        
-    def forward(self, x, mask=None):
+
+    def forward(self, x, vision_memory, mask=None):
         # Self-attention
-        attn_output = self.attention(x, x, x, mask)
+        attn_output = self.self_attention(x, x, x, mask)
         x = self.norm1(x + attn_output)
-        
+
+        # Cross-attention to vision features
+        cross_attn_output = self.cross_attention(x, vision_memory)
+        x = self.norm2(x + cross_attn_output)
+
         # Feed-forward
         ffn_output = self.ffn(x)
-        x = self.norm2(x + ffn_output)
-        
+        x = self.norm3(x + ffn_output)
+
         return x
 
 class ToyVLM(nn.Module):
@@ -160,37 +203,30 @@ class ToyVLM(nn.Module):
     def forward(self, images, input_tokens):
         batch_size, seq_len = input_tokens.shape
         device = input_tokens.device
-        
-        # Encode vision
+
+        # Encode vision features as memory
         vision_features = self.vision_encoder(images)  # [batch, hidden_dim]
-        vision_features = self.vision_projection(vision_features)
-        vision_features = vision_features.unsqueeze(1)  # [batch, 1, hidden_dim]
-        
-        # Embed tokens
+        vision_memory = self.vision_projection(vision_features)
+        vision_memory = vision_memory.unsqueeze(1)  # [batch, 1, hidden_dim]
+
+        # Embed text tokens
         token_embeds = self.token_embedding(input_tokens)  # [batch, seq_len, hidden_dim]
         positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
         position_embeds = self.position_embedding(positions)
-        
+
         text_embeds = self.dropout(token_embeds + position_embeds)
-        
-        # Concatenate vision features as prefix
-        combined = torch.cat([vision_features, text_embeds], dim=1)  # [batch, 1+seq_len, hidden_dim]
-        
-        # Create causal mask (including vision prefix)
-        total_len = 1 + seq_len
-        mask = self.create_causal_mask(total_len, device)
-        
-        # Pass through transformer
-        hidden = combined
+
+        # Create causal mask for text only
+        mask = self.create_causal_mask(seq_len, device)
+
+        # Pass through transformer with cross-attention
+        hidden = text_embeds
         for block in self.transformer_blocks:
-            hidden = block(hidden, mask)
-        
-        # Get only text positions for output (skip vision prefix)
-        text_hidden = hidden[:, 1:, :]  # [batch, seq_len, hidden_dim]
-        
+            hidden = block(hidden, vision_memory, mask)
+
         # Project to vocabulary
-        logits = self.output_projection(text_hidden)
-        
+        logits = self.output_projection(hidden)
+
         return logits
 
 @torch.no_grad()

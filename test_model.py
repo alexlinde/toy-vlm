@@ -15,6 +15,45 @@ from shapes import ShapeGenerator
 from text import SimpleTokenizer, TextProcessor
 from model import ToyVLM, DEVICE, generate_response
 
+def get_model_stats(model):
+    """Get comprehensive model statistics."""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # Component-wise parameter counts
+    vision_params = sum(p.numel() for p in model.vision_encoder.parameters())
+    text_embed_params = sum(p.numel() for p in model.token_embedding.parameters()) + \
+                      sum(p.numel() for p in model.position_embedding.parameters())
+    transformer_params = sum(p.numel() for p in model.transformer_blocks.parameters())
+    output_params = sum(p.numel() for p in model.output_projection.parameters())
+
+    # Model size in MB (assuming float32)
+    model_size_mb = total_params * 4 / (1024 * 1024)
+
+    return {
+        'total_params': total_params,
+        'trainable_params': trainable_params,
+        'vision_params': vision_params,
+        'text_embed_params': text_embed_params,
+        'transformer_params': transformer_params,
+        'output_params': output_params,
+        'vocab_size': model.output_projection.out_features,
+        'hidden_dim': model.token_embedding.embedding_dim,
+        'num_layers': len(model.transformer_blocks),
+        'num_heads': model.transformer_blocks[0].self_attention.num_heads,
+        'device': str(next(model.parameters()).device),
+        'model_size_mb': model_size_mb
+    }
+
+def format_number(num):
+    """Format large numbers with appropriate suffixes."""
+    if num >= 1_000_000:
+        return f"{num / 1_000_000:.2f}M"
+    elif num >= 1_000:
+        return f"{num / 1_000:.1f}K"
+    else:
+        return str(num)
+
 class ToyVLMGUI:
     """Tkinter GUI for the Toy VLM."""
     
@@ -134,12 +173,32 @@ class ToyVLMGUI:
         # Send button
         ttk.Button(entry_button_frame, text="Ask Question", command=self.ask_question).pack(side=tk.RIGHT)
         
+        # Display model statistics
+        self.display_model_stats()
+
         # Add initial welcome message
         self.add_to_chat("Ask me what I can see in the image", "System")
-        
+
         # Give focus to question entry
         self.question_entry.focus_set()
     
+    def display_model_stats(self):
+        """Display model statistics in the chat."""
+        stats = get_model_stats(self.model)
+
+        stats_text = f"📊 Model Statistics:\n"
+        stats_text += f"• Total Parameters: {format_number(stats['total_params'])}\n"
+        stats_text += f"• Vision Encoder: {format_number(stats['vision_params'])}\n"
+        stats_text += f"• Text Embeddings: {format_number(stats['text_embed_params'])}\n"
+        stats_text += f"• Transformer Blocks: {format_number(stats['transformer_params'])}\n"
+        stats_text += f"• Output Layer: {format_number(stats['output_params'])}\n"
+        stats_text += f"• Model Size: {stats['model_size_mb']:.1f} MB\n"
+        stats_text += f"• Architecture: {stats['hidden_dim']}d, {stats['num_layers']} layers, {stats['num_heads']} heads\n"
+        stats_text += f"• Vocabulary Size: {format_number(stats['vocab_size'])}\n"
+        stats_text += f"• Device: {stats['device']}"
+
+        self.add_to_chat(stats_text, "System")
+
     def add_to_chat(self, message, sender="User"):
         """Add a message to the chat display."""
         self.chat_display.config(state='normal')
@@ -149,7 +208,7 @@ class ToyVLMGUI:
             self.chat_display.insert(tk.END, f"👤 {message}\n")
         else:  # VLM response
             self.chat_display.insert(tk.END, f"🎯 {message}\n\n")
-        
+
         self.chat_display.config(state='disabled')
         self.chat_display.see(tk.END)
     
