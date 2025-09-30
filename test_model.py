@@ -57,22 +57,26 @@ def format_number(num):
 class ToyVLMGUI:
     """Tkinter GUI for the Toy VLM."""
     
-    def __init__(self, model_path='toy_vlm.pth', tokenizer_vocab='tokenizer_vocab.json'):
+    def __init__(self, model_path='toy_vlm_cot.pth', tokenizer_vocab='tokenizer_vocab.json'):
         # Initialize text processing with pretrained tokenizer
         self.tokenizer = SimpleTokenizer.load_pretrained(tokenizer_vocab)
         self.text_processor = TextProcessor()
         self.text_processor.tokenizer = self.tokenizer
-        
-        # Initialize model components
-        self.model = ToyVLM(self.text_processor)
+
+        # Initialize model components (with CoT support: 6 layers)
+        self.model = ToyVLM(self.text_processor, num_layers=6,)
         self.model.load_state_dict(torch.load(model_path, map_location=DEVICE))
         self.model.to(DEVICE)
         self.model.eval()
-        
+
         self.shape_generator = ShapeGenerator()
-        
+
         self.current_shape_type = None
         self.current_image = None
+        self.current_metadata = None  # Store metadata for multi-shape images
+
+        # CoT display toggle
+        self.show_rationale = True
         
         # Question history for navigation
         self.question_history = []
@@ -172,12 +176,26 @@ class ToyVLMGUI:
 
         # Send button
         ttk.Button(entry_button_frame, text="Ask Question", command=self.ask_question).pack(side=tk.RIGHT)
-        
+
+        # Add CoT toggle checkbox
+        cot_frame = ttk.Frame(input_frame)
+        cot_frame.pack(fill=tk.X, pady=(0, 5))
+        self.show_rationale_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(cot_frame, text="Show Chain-of-Thought Reasoning",
+                       variable=self.show_rationale_var,
+                       command=self.on_rationale_toggle).pack(anchor='w')
+
         # Display model statistics
         self.display_model_stats()
 
         # Add initial welcome message
-        self.add_to_chat("Ask me what I can see in the image", "System")
+        welcome_msg = "🧠 Chain-of-Thought VLM Ready!\n"
+        welcome_msg += "Ask questions about the shapes:\n"
+        welcome_msg += "• 'what shapes do you see?'\n"
+        welcome_msg += "• 'how many circles are there?'\n"
+        welcome_msg += "• 'are there more circles than squares?'\n"
+        welcome_msg += "• 'how many red shapes are there?'"
+        self.add_to_chat(welcome_msg, "System")
 
         # Give focus to question entry
         self.question_entry.focus_set()
@@ -213,23 +231,33 @@ class ToyVLMGUI:
         self.chat_display.see(tk.END)
     
     def generate_new_shape(self):
-        """Generate a new random shape and update the display."""
-        self.current_shape_type, self.current_image = self.shape_generator.generate_random_shape(add_noise=False)
+        """Generate a new multi-shape RGB image and update the display."""
+        # Generate multi-shape RGB image with metadata
+        self.current_image, self.current_metadata = self.shape_generator.generate_multi_shape_image(add_noise=False)
         self.update_canvas_display()
-        
-        # Add to chat
-        # self.add_to_chat(f"Generated a new {self.current_shape_type}!", "System")
+
+        # Display shape info in chat
+        shape_info = f"Generated {len(self.current_metadata)} shapes: "
+        shape_summary = [f"{m['color']} {m['size_category']} {m['shape']}" for m in self.current_metadata]
+        shape_info += ", ".join(shape_summary)
+        # self.add_to_chat(shape_info, "System")
     
     def update_canvas_display(self):
         """Update the canvas with the current image."""
         # Convert numpy array to PIL Image and then to PhotoImage
+        # Handle both RGB (H, W, 3) and grayscale (H, W) images
         img_array = (self.current_image * 255).astype(np.uint8)
-        pil_img = Image.fromarray(img_array)
+
+        if img_array.ndim == 3:  # RGB image
+            pil_img = Image.fromarray(img_array, mode='RGB')
+        else:  # Grayscale image
+            pil_img = Image.fromarray(img_array, mode='L')
+
         self.img_size = pil_img.size
         pil_img = pil_img.resize((self.canvas_scale, self.canvas_scale), Image.NEAREST)  # Scale up with nearest neighbor
-        
+
         self.photo = ImageTk.PhotoImage(pil_img)
-        
+
         # Clear canvas and display image
         self.canvas.delete("all")
         self.canvas.create_image(150, 150, image=self.photo, anchor='center')
@@ -291,10 +319,25 @@ class ToyVLMGUI:
     
     def _process_question(self, question):
         """Process the question in a background thread."""
-        response = generate_response(self.model, self.current_image, question)
-        
+        # Convert numpy array (H, W, C) to torch tensor (C, H, W)
+        image_tensor = torch.from_numpy(self.current_image).permute(2, 0, 1).float()
+
+        # Generate response with chain-of-thought
+        rationale, answer = generate_response(self.model, image_tensor, question,
+                                               max_length=35, return_rationale=True)
+
+        # Format response based on show_rationale setting
+        if self.show_rationale_var.get() and rationale:
+            response = f"💭 Reasoning: {rationale}\n\n✓ Answer: {answer}"
+        else:
+            response = answer
+
         # Update GUI in main thread
         self.root.after(0, self.add_to_chat, response, "VLM")
+
+    def on_rationale_toggle(self):
+        """Handle rationale display toggle."""
+        self.show_rationale = self.show_rationale_var.get()
     
     def on_tool_change(self):
         """Handle tool selection change."""
@@ -338,17 +381,29 @@ class ToyVLMGUI:
     def draw_shape(self, shape_type, center_x, center_y, size, fill_color):
         """Draw or erase a shape at the specified position using Pillow."""
         # Convert numpy array to PIL Image
-        pil_img = Image.fromarray((self.current_image * 255).astype(np.uint8))
+        img_array = (self.current_image * 255).astype(np.uint8)
+
+        # Handle RGB vs grayscale
+        if img_array.ndim == 3:
+            pil_img = Image.fromarray(img_array, mode='RGB')
+            # For RGB, use white for draw, black for erase
+            if fill_color == 255:
+                fill_color = (255, 255, 255)
+            else:
+                fill_color = (0, 0, 0)
+        else:
+            pil_img = Image.fromarray(img_array, mode='L')
+
         draw = ImageDraw.Draw(pil_img)
         half_size = size // 2
         x1 = center_x - half_size; y1 = center_y - half_size;
         x2 = center_x + half_size; y2 = center_y + half_size;
-        
+
         if shape_type == 'square':
-            draw.rectangle([x1, y1, x2, y2], fill=fill_color)            
+            draw.rectangle([x1, y1, x2, y2], fill=fill_color)
         elif shape_type == 'circle':
             draw.ellipse([x1, y1, x2, y2], fill=fill_color)
-        
+
         # Convert back to numpy array
         self.current_image = np.array(pil_img, dtype=np.float32) / 255.0
     

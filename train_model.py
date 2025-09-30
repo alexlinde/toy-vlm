@@ -1,6 +1,7 @@
 """
 Toy Vision Language Model (VLM) in PyTorch
 A simple VLM that can understand basic shapes and answer questions about them.
+Now with chain-of-thought reasoning capabilities.
 """
 
 import torch
@@ -8,8 +9,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
+from typing import Dict, List, Any
 from shapes import ShapeGenerator
-from questions import QuestionGenerator
+from questions import RationaleGenerator
 from text import TextProcessor, MAX_SEQ_LEN
 from model import ToyVLM, DEVICE
 
@@ -19,124 +21,323 @@ NUM_EPOCHS = 10
 LEARNING_RATE = 2e-4
 
 class ShapeDataset(Dataset):
-    """Dataset that generates simple geometric shapes with Q&A pairs."""
-    
-    def __init__(self, num_samples: int, text_processor: TextProcessor = None):
+    """Dataset that generates multi-shape images with Q&A pairs and rationales."""
+
+    def __init__(self, num_samples: int, text_processor: TextProcessor = None,
+                 difficulty: str = 'easy'):
         self.num_samples = num_samples
         self.shape_generator = ShapeGenerator()
-        self.question_generator = QuestionGenerator()
+        from questions import RationaleGenerator
+        self.rationale_generator = RationaleGenerator()
         self.text_processor = text_processor or TextProcessor()
-        
+        self.difficulty = difficulty
+
     def __len__(self):
         return self.num_samples
-    
+
     def __getitem__(self, idx):
-        # Generate random shape
-        shape_type, image = self.shape_generator.generate_random_shape()
-        
-        # Generate Q&A pair
-        question, answer = self.question_generator.generate_qa_pair(shape_type)
-        
-        # Prepare sequences using text processor
-        input_tokens, target_tokens = self.text_processor.prepare_input_sequence(question, answer)
-        
-        # Pad sequences
-        if len(input_tokens) > MAX_SEQ_LEN:
-            input_tokens = input_tokens[:MAX_SEQ_LEN]
-        if len(target_tokens) > MAX_SEQ_LEN:
-            target_tokens = target_tokens[:MAX_SEQ_LEN]
-            
-        input_len = len(input_tokens)
-        target_len = len(target_tokens)
-        
-        input_tokens = self.text_processor.pad_sequence(input_tokens)
-        target_tokens = self.text_processor.pad_sequence(target_tokens)
-        
+        # Generate multi-shape RGB image with metadata
+        image, metadata_list = self.shape_generator.generate_multi_shape_image()
+
+        # Generate Q&A pair with rationale based on metadata
+        question, answer, rationale = self.rationale_generator.generate_qa_with_rationale(
+            metadata_list, difficulty=self.difficulty
+        )
+
+        inp_ids, tgt_ids, loss_mask = self.text_processor.prepare_input_sequence(
+            question, answer, rationale, mask_controls=True
+        )
+
+        # Generate auxiliary labels from metadata
+        aux_labels = self._generate_aux_labels(metadata_list)
+
+        # ---- build span masks aligned to target (shift-aware) ----
+        tok = self.text_processor.tokenizer
+        # We locate span boundaries in the *input* (pre-shift)
+        def find_first(seq, tid):
+            try:
+                return seq.index(tid)
+            except ValueError:
+                return None
+
+        q_len = len(self.text_processor.tokenizer.tokenize(question))
+        q_idx_end = 1 + q_len - 1  # last question token index in input (after <START>)
+        reason_idx = find_first(inp_ids, tok.reason_token_id)
+        sep_idx    = find_first(inp_ids, tok.sep_token_id)
+        final_idx  = find_first(inp_ids, tok.final_token_id)
+
+        T = len(tgt_ids)
+        rat_mask = [0]*T
+        ans_mask = [0]*T
+        # In target space, predicting token at input[k] happens at target position k.
+        if reason_idx is not None and sep_idx is not None and sep_idx >= reason_idx+1:
+            # rationale tokens are input[reason_idx+1 .. sep_idx]  -> target positions [reason_idx+1 .. sep_idx]
+            for t in range(reason_idx+1, min(sep_idx+1, T)):
+                rat_mask[t] = 1
+        if final_idx is not None:
+            # answer tokens are input[final_idx .. end] -> target positions [final_idx .. T-1]
+            for t in range(final_idx, T):
+                ans_mask[t] = 1
+
+        # ---- truncate to MAX_SEQ_LEN together (before padding) ----
+        def trunc(x, L=MAX_SEQ_LEN): return x[:L]
+        inp_ids   = trunc(inp_ids);   tgt_ids   = trunc(tgt_ids)
+        loss_mask = trunc(loss_mask); rat_mask  = trunc(rat_mask); ans_mask = trunc(ans_mask)
+
+        # ---- pad everything ----
+        inp_ids   = self.text_processor.pad_sequence(inp_ids)
+        tgt_ids   = self.text_processor.pad_sequence(tgt_ids)
+        loss_mask = self.text_processor.pad_sequence(loss_mask)
+        rat_mask  = self.text_processor.pad_sequence(rat_mask)
+        ans_mask  = self.text_processor.pad_sequence(ans_mask)
+
+        # ---- image normalization (important!) ----
+        img = torch.tensor(image, dtype=torch.float32).permute(2,0,1)  # (3,H,W)
+        if img.max() > 1.0:
+            img = img / 255.0
+        if img.shape[-2:] != (64,64):
+            import torch.nn.functional as F
+            img = F.interpolate(img.unsqueeze(0), size=(64,64), mode="bilinear", align_corners=False).squeeze(0)
+
         return {
-            'image': torch.tensor(image, dtype=torch.float32).unsqueeze(0),  # Add channel dim
-            'input_tokens': torch.tensor(input_tokens, dtype=torch.long),
-            'target_tokens': torch.tensor(target_tokens, dtype=torch.long),
-            'input_len': input_len,
-            'target_len': target_len,
-            'question': question,
-            'answer': answer
+            'image': img,
+            'input_tokens': torch.tensor(inp_ids, dtype=torch.long),
+            'target_tokens': torch.tensor(tgt_ids, dtype=torch.long),
+            'loss_mask': torch.tensor(loss_mask, dtype=torch.float32),
+            'rat_mask': torch.tensor(rat_mask, dtype=torch.float32),
+            'ans_mask': torch.tensor(ans_mask, dtype=torch.float32),
+            'question': question, 'answer': answer, 'rationale': rationale,
+            'aux_labels': aux_labels, 'metadata': metadata_list
         }
 
-def train_model(model, train_loader, num_epochs=NUM_EPOCHS):
-    """Train the VLM model."""
+
+    def _generate_aux_labels(self, metadata_list: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """Generate ground truth labels for auxiliary heads."""
+        shape_to_idx = {'square': 0, 'circle': 1, 'rectangle': 2, 'cross': 3, 'triangle': 4, 'background': 5}
+        size_to_idx = {'small': 0, 'medium': 1, 'large': 2}
+
+        # Count each shape type (for count heads)
+        shape_counts = {shape: 0 for shape in ['square', 'circle', 'rectangle', 'cross', 'triangle']}
+        for m in metadata_list:
+            shape_counts[m['shape']] += 1
+
+        count_labels = {shape: min(count, 4) for shape, count in shape_counts.items()}  # Cap at 4
+
+        return {
+            'counts': count_labels,  # Will be used for count head loss
+            # Note: per-token shape/size labels would require spatial ground truth maps
+            # For now, we'll use the count labels as the primary auxiliary supervision
+        }
+
+def get_loss_weights(epoch: int) -> Dict[str, float]:
+    """Get loss weights based on curriculum schedule.
+
+    Note: Losses are now summed (not per-token averaged), so token counts
+    naturally affect the loss magnitude. We use modest weights for balance.
+    """
+    if epoch < 3:  # Epochs 0-2: Learn basic structure
+        return {'rationale': 1.0, 'answer': 2.0, 'aux': 0.5}
+    elif epoch < 6:  # Epochs 3-5: Balance with emphasis on answers
+        return {'rationale': 0.8, 'answer': 3.0, 'aux': 0.3}
+    else:  # Epochs 6+: Strong focus on correct answers
+        return {'rationale': 0.5, 'answer': 4.0, 'aux': 0.2}
+
+
+def compute_weighted_loss(
+    logits, target_tokens, loss_mask, rat_mask, ans_mask,
+    aux_outputs, aux_labels, tokenizer, loss_weights
+):
+    V = tokenizer.get_vocab_size()
+    # CE per token
+    ce = F.cross_entropy(
+        logits.reshape(-1, V),
+        target_tokens.reshape(-1),
+        ignore_index=tokenizer.pad_token_id,
+        label_smoothing=0.1,
+        reduction='none'
+    ).view(target_tokens.size(0), -1)
+
+    # masks: [B,T] float {0,1}
+    def masked_mean(x, m):
+        denom = m.sum().clamp_min(1.0)
+        return (x * m).sum() / denom
+
+    # overall supervised part (rationale+answer)
+    sup_loss = masked_mean(ce, loss_mask)
+
+    # components
+    rationale_loss = masked_mean(ce, rat_mask)
+    answer_loss    = masked_mean(ce, ans_mask)
+
+    # aux (counts)
+    aux_loss = 0.0
+    if aux_outputs is not None and 'count_logits' in aux_outputs:
+        for shape, head_logits in aux_outputs['count_logits'].items():
+            targets = torch.tensor([al['counts'][shape] for al in aux_labels],
+                                   device=head_logits.device, dtype=torch.long)
+            aux_loss += F.cross_entropy(head_logits, targets)
+        aux_loss /= len(aux_outputs['count_logits']) if len(aux_outputs['count_logits']) else 1.0
+
+    total = (loss_weights['rationale'] * rationale_loss +
+             loss_weights['answer']    * answer_loss +
+             loss_weights['aux']       * aux_loss)
+
+    return total, rationale_loss, answer_loss, aux_loss
+
+
+def create_curriculum_datasets(text_processor, samples_per_epoch=10000):
+    """Create datasets for curriculum learning with increasing difficulty."""
+    datasets = []
+
+    # Epochs 0-2: Easy questions (existence, identification)
+    for _ in range(3):
+        datasets.append(ShapeDataset(
+            num_samples=samples_per_epoch,
+            text_processor=text_processor,
+            difficulty='easy'
+        ))
+
+    # Epochs 3-5: Medium questions (counting, single-hop)
+    for _ in range(3):
+        datasets.append(ShapeDataset(
+            num_samples=samples_per_epoch,
+            text_processor=text_processor,
+            difficulty='medium'
+        ))
+
+    # Epochs 6-9: Hard questions (comparison, multi-hop)
+    for _ in range(4):
+        datasets.append(ShapeDataset(
+            num_samples=samples_per_epoch,
+            text_processor=text_processor,
+            difficulty='hard'
+        ))
+
+    return datasets
+
+def collate_fn(batch):
+    return {
+        'image':         torch.stack([b['image'] for b in batch]),
+        'input_tokens':  torch.stack([b['input_tokens'] for b in batch]),
+        'target_tokens': torch.stack([b['target_tokens'] for b in batch]),
+        'loss_mask':     torch.stack([b['loss_mask'] for b in batch]),
+        'rat_mask':      torch.stack([b['rat_mask'] for b in batch]),
+        'ans_mask':      torch.stack([b['ans_mask'] for b in batch]),
+        'aux_labels':    [b['aux_labels'] for b in batch],
+        'metadata':      [b['metadata'] for b in batch],
+        'question':      [b['question'] for b in batch],
+        'answer':        [b['answer'] for b in batch],
+        'rationale':     [b['rationale'] for b in batch],
+    }
+
+def train_with_curriculum(model, datasets, num_epochs=NUM_EPOCHS):
+    """Train model with curriculum learning across different difficulty levels."""
     model = model.to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
     scheduler = StepLR(optimizer, step_size=3, gamma=0.5)
-    
+
     print(f"Training on {DEVICE}")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Learning rate schedule: StepLR(step_size=3, gamma=0.5)")
-    
+    print("Using curriculum learning with difficulty progression")
+
     for epoch in range(num_epochs):
+        # Get dataset for this epoch
+        dataset = datasets[epoch]
+        train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, collate_fn=collate_fn)
+
         model.train()
         total_loss = 0
-        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
-        
+        total_rationale_loss = 0
+        total_answer_loss = 0
+        total_aux_loss = 0
+
+        # Get loss weights for this epoch
+        loss_weights = get_loss_weights(epoch)
+
+        difficulty = dataset.difficulty
+        print(f"\nEpoch {epoch+1}/{num_epochs} - Difficulty: {difficulty}")
+        print(f"Loss weights: {loss_weights}")
+        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}')
+
         for batch in progress_bar:
             images = batch['image'].to(DEVICE)
-            input_tokens = batch['input_tokens'].to(DEVICE)
-            target_tokens = batch['target_tokens'].to(DEVICE)
-            
-            # Forward pass
-            logits = model(images, input_tokens)
-            
-            # Compute loss
-            loss = F.cross_entropy(
-                logits.reshape(-1, model.text_processor.tokenizer.get_vocab_size()),
-                target_tokens.reshape(-1),
-                ignore_index=model.text_processor.tokenizer.pad_token_id
+            inp = batch['input_tokens'].to(DEVICE)
+            tgt = batch['target_tokens'].to(DEVICE)
+            loss_mask = batch['loss_mask'].to(DEVICE)
+            rat_mask  = batch['rat_mask'].to(DEVICE)
+            ans_mask  = batch['ans_mask'].to(DEVICE)
+            aux_labels = batch['aux_labels']
+
+            logits, aux_outputs = model(images, inp, return_aux=True)
+
+            loss, rat_loss, ans_loss, aux_loss = compute_weighted_loss(
+                logits, tgt, loss_mask, rat_mask, ans_mask,
+                aux_outputs, aux_labels, model.text_processor.tokenizer, loss_weights
             )
-            
+
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            
+
             total_loss += loss.item()
-            progress_bar.set_postfix({'loss': loss.item(), 'lr': scheduler.get_last_lr()[0]})
-        
+            total_rationale_loss += rat_loss.item()
+            total_answer_loss += ans_loss.item()
+            total_aux_loss += aux_loss if isinstance(aux_loss, float) else aux_loss.item()
+
+            progress_bar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'rat': f'{rat_loss.item():.3f}',
+                'ans': f'{ans_loss.item():.3f}',
+                'aux': f'{aux_loss if isinstance(aux_loss, float) else aux_loss.item():.3f}'
+            })
+
         avg_loss = total_loss / len(train_loader)
-        current_lr = scheduler.get_last_lr()[0]
-        print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}, Learning Rate: {current_lr:.6f}")
-        
-        # Step the scheduler
+        avg_rat_loss = total_rationale_loss / len(train_loader)
+        avg_ans_loss = total_answer_loss / len(train_loader)
+        avg_aux_loss = total_aux_loss / len(train_loader)
+
+        print(f"Epoch {epoch+1} Summary:")
+        print(f"  Total Loss: {avg_loss:.4f}")
+        print(f"  Rationale Loss: {avg_rat_loss:.4f}")
+        print(f"  Answer Loss: {avg_ans_loss:.4f}")
+        print(f"  Aux Loss: {avg_aux_loss:.4f}")
+        print(f"  Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+
         scheduler.step()
-        
+
     return model
 
 
 def main():
-    """Main training function."""
-    print("Initializing Toy VLM...")
-    
-    # Build tokenizer vocabulary from questions
-    print("Building tokenizer vocabulary...")
-    question_gen = QuestionGenerator()
+    """Main training function with chain-of-thought reasoning."""
+    print("Initializing Toy VLM with Chain-of-Thought Reasoning...")
+
+    # Build tokenizer vocabulary from rationales (NEW - uses RationaleGenerator)
+    print("Building tokenizer vocabulary from RationaleGenerator...")
+    rationale_gen = RationaleGenerator()
     text_processor = TextProcessor()
-    text_processor.tokenizer.build_vocab_from_questions(question_gen)
-    
+    text_processor.tokenizer.build_vocab_from_rationales(rationale_gen, num_samples=200)
+
     # Save the tokenizer vocabulary
     text_processor.tokenizer.save_vocab('tokenizer_vocab.json')
-    
+    print(f"Vocabulary size: {text_processor.tokenizer.get_vocab_size()}")
+
     # Create model with the built tokenizer
-    model = ToyVLM(text_processor)
-    
-    # Create dataset with the built text processor
-    train_dataset = ShapeDataset(num_samples=10000, text_processor=text_processor)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    
-    # Train model
-    model = train_model(model, train_loader, num_epochs=NUM_EPOCHS)
-    
+    model = ToyVLM(text_processor, num_layers=6)  # Increased layers for reasoning
+
+    # Create curriculum datasets
+    print("\nCreating curriculum datasets...")
+    datasets = create_curriculum_datasets(text_processor, samples_per_epoch=10000)
+
+    # Train model with curriculum
+    model = train_with_curriculum(model, datasets, num_epochs=NUM_EPOCHS)
+
     # Save model
-    torch.save(model.state_dict(), 'toy_vlm.pth')
-    print("Training complete. Model and tokenizer saved.")
+    torch.save(model.state_dict(), 'toy_vlm_cot.pth')
+    print("\nTraining complete. Model saved as 'toy_vlm_cot.pth'")
+
 
 if __name__ == "__main__":
     main()
