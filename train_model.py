@@ -10,10 +10,11 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 from typing import Dict, List, Any
-from shapes import ShapeGenerator
+from shapes import ShapeGenerator, ObjType
 from questions import RationaleGenerator
 from text import TextProcessor, MAX_SEQ_LEN
 from model import ToyVLM, DEVICE
+import random
 
 # Training constants
 BATCH_SIZE = 32
@@ -23,13 +24,11 @@ LEARNING_RATE = 2e-4
 class ShapeDataset(Dataset):
     """Dataset that generates multi-shape images with Q&A pairs and rationales."""
 
-    def __init__(self, num_samples: int, text_processor: TextProcessor = None,
-                 difficulty: str = 'easy'):
+    def __init__(self, num_samples: int, text_processor: TextProcessor, difficulty: str):
         self.num_samples = num_samples
         self.shape_generator = ShapeGenerator()
-        from questions import RationaleGenerator
         self.rationale_generator = RationaleGenerator()
-        self.text_processor = text_processor or TextProcessor()
+        self.text_processor = text_processor
         self.difficulty = difficulty
 
     def __len__(self):
@@ -37,73 +36,46 @@ class ShapeDataset(Dataset):
 
     def __getitem__(self, idx):
         # Generate multi-shape RGB image with metadata
-        image, metadata_list = self.shape_generator.generate_multi_shape_image()
+        num_shapes = random.randint(1, 4)
+        image, metadata_list = self.shape_generator.generate_multi_shape_image(num_shapes, True)
 
         # Generate Q&A pair with rationale based on metadata
         question, answer, rationale = self.rationale_generator.generate_qa_with_rationale(
             metadata_list, difficulty=self.difficulty
         )
 
-        inp_ids, tgt_ids, loss_mask = self.text_processor.prepare_input_sequence(
-            question, answer, rationale, mask_controls=True
+        inp_ids, tgt_ids, rat_mask, ans_mask = self.text_processor.prepare_input_sequence(
+            question, answer, rationale
         )
 
         # Generate auxiliary labels from metadata
         aux_labels = self._generate_aux_labels(metadata_list)
 
-        # ---- build span masks aligned to target (shift-aware) ----
-        tok = self.text_processor.tokenizer
-        # We locate span boundaries in the *input* (pre-shift)
-        def find_first(seq, tid):
-            try:
-                return seq.index(tid)
-            except ValueError:
-                return None
-
-        q_len = len(self.text_processor.tokenizer.tokenize(question))
-        q_idx_end = 1 + q_len - 1  # last question token index in input (after <START>)
-        reason_idx = find_first(inp_ids, tok.reason_token_id)
-        sep_idx    = find_first(inp_ids, tok.sep_token_id)
-        final_idx  = find_first(inp_ids, tok.final_token_id)
-
-        T = len(tgt_ids)
-        rat_mask = [0]*T
-        ans_mask = [0]*T
-        # In target space, predicting token at input[k] happens at target position k.
-        if reason_idx is not None and sep_idx is not None and sep_idx >= reason_idx+1:
-            # rationale tokens are input[reason_idx+1 .. sep_idx]  -> target positions [reason_idx+1 .. sep_idx]
-            for t in range(reason_idx+1, min(sep_idx+1, T)):
-                rat_mask[t] = 1
-        if final_idx is not None:
-            # answer tokens are input[final_idx .. end] -> target positions [final_idx .. T-1]
-            for t in range(final_idx, T):
-                ans_mask[t] = 1
-
         # ---- truncate to MAX_SEQ_LEN together (before padding) ----
         def trunc(x, L=MAX_SEQ_LEN): return x[:L]
         inp_ids   = trunc(inp_ids);   tgt_ids   = trunc(tgt_ids)
-        loss_mask = trunc(loss_mask); rat_mask  = trunc(rat_mask); ans_mask = trunc(ans_mask)
+        rat_mask  = trunc(rat_mask); ans_mask = trunc(ans_mask)
 
         # ---- pad everything ----
         inp_ids   = self.text_processor.pad_sequence(inp_ids)
         tgt_ids   = self.text_processor.pad_sequence(tgt_ids)
-        loss_mask = self.text_processor.pad_sequence(loss_mask)
         rat_mask  = self.text_processor.pad_sequence(rat_mask)
         ans_mask  = self.text_processor.pad_sequence(ans_mask)
 
-        # ---- image normalization (important!) ----
-        img = torch.tensor(image, dtype=torch.float32).permute(2,0,1)  # (3,H,W)
-        if img.max() > 1.0:
-            img = img / 255.0
-        if img.shape[-2:] != (64,64):
-            import torch.nn.functional as F
-            img = F.interpolate(img.unsqueeze(0), size=(64,64), mode="bilinear", align_corners=False).squeeze(0)
+        # ---- image normalization (grayscale) ----
+        # Grayscale image: (H,W) -> (1,H,W)
+        img = torch.tensor(image, dtype=torch.float32).unsqueeze(0) / 255.0 # (1,H,W)
+
+        # Shape and normalization assertions
+        assert img.dtype == torch.float32, f"Image dtype should be float32, got {img.dtype}"
+        assert img.shape == (1, 64, 64), f"Image shape should be (1, 64, 64), got {img.shape}"
+        assert 0.0 <= img.min() and img.max() <= 1.0, \
+            f"Image should be normalized to [0,1], got range [{img.min():.3f}, {img.max():.3f}]"
 
         return {
             'image': img,
             'input_tokens': torch.tensor(inp_ids, dtype=torch.long),
             'target_tokens': torch.tensor(tgt_ids, dtype=torch.long),
-            'loss_mask': torch.tensor(loss_mask, dtype=torch.float32),
             'rat_mask': torch.tensor(rat_mask, dtype=torch.float32),
             'ans_mask': torch.tensor(ans_mask, dtype=torch.float32),
             'question': question, 'answer': answer, 'rationale': rationale,
@@ -113,20 +85,26 @@ class ShapeDataset(Dataset):
 
     def _generate_aux_labels(self, metadata_list: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Generate ground truth labels for auxiliary heads."""
-        shape_to_idx = {'square': 0, 'circle': 1, 'rectangle': 2, 'cross': 3, 'triangle': 4, 'background': 5}
+        shape_to_idx = {obj_type.value: idx for idx, obj_type in enumerate(ObjType)}
+        shape_to_idx['background'] = len(ObjType)
         size_to_idx = {'small': 0, 'medium': 1, 'large': 2}
 
         # Count each shape type (for count heads)
-        shape_counts = {shape: 0 for shape in ['square', 'circle', 'rectangle', 'cross', 'triangle']}
+        shape_counts = {obj_type.value: 0 for obj_type in ObjType}
+        # Count each size category
+        size_counts = {size: 0 for size in ['small', 'medium', 'large']}
         for m in metadata_list:
             shape_counts[m['shape']] += 1
+            sc = m.get('size_category')
+            if sc in size_counts:
+                size_counts[sc] += 1
 
         count_labels = {shape: min(count, 4) for shape, count in shape_counts.items()}  # Cap at 4
+        size_count_labels = {sz: min(count, 4) for sz, count in size_counts.items()}    # Cap at 4
 
         return {
-            'counts': count_labels,  # Will be used for count head loss
-            # Note: per-token shape/size labels would require spatial ground truth maps
-            # For now, we'll use the count labels as the primary auxiliary supervision
+            'counts': count_labels,
+            'size_counts': size_count_labels,
         }
 
 def get_loss_weights(epoch: int) -> Dict[str, float]:
@@ -144,7 +122,7 @@ def get_loss_weights(epoch: int) -> Dict[str, float]:
 
 
 def compute_weighted_loss(
-    logits, target_tokens, loss_mask, rat_mask, ans_mask,
+    logits, target_tokens, rat_mask, ans_mask,
     aux_outputs, aux_labels, tokenizer, loss_weights
 ):
     V = tokenizer.get_vocab_size()
@@ -162,21 +140,33 @@ def compute_weighted_loss(
         denom = m.sum().clamp_min(1.0)
         return (x * m).sum() / denom
 
-    # overall supervised part (rationale+answer)
-    sup_loss = masked_mean(ce, loss_mask)
-
     # components
     rationale_loss = masked_mean(ce, rat_mask)
     answer_loss    = masked_mean(ce, ans_mask)
 
     # aux (counts)
     aux_loss = 0.0
-    if aux_outputs is not None and 'count_logits' in aux_outputs:
-        for shape, head_logits in aux_outputs['count_logits'].items():
-            targets = torch.tensor([al['counts'][shape] for al in aux_labels],
-                                   device=head_logits.device, dtype=torch.long)
-            aux_loss += F.cross_entropy(head_logits, targets)
-        aux_loss /= len(aux_outputs['count_logits']) if len(aux_outputs['count_logits']) else 1.0
+    if aux_outputs is not None:
+        # Shape count losses
+        if 'count_logits' in aux_outputs:
+            for shape, head_logits in aux_outputs['count_logits'].items():
+                targets = torch.tensor([al['counts'][shape] for al in aux_labels],
+                                       device=head_logits.device, dtype=torch.long)
+                aux_loss += F.cross_entropy(head_logits, targets)
+        # Size count losses
+        if 'size_count_logits' in aux_outputs:
+            for size, head_logits in aux_outputs['size_count_logits'].items():
+                targets = torch.tensor([al['size_counts'][size] for al in aux_labels],
+                                       device=head_logits.device, dtype=torch.long)
+                aux_loss += F.cross_entropy(head_logits, targets)
+        # Normalize by number of heads that contributed
+        num_heads = 0
+        if 'count_logits' in aux_outputs:
+            num_heads += len(aux_outputs['count_logits'])
+        if 'size_count_logits' in aux_outputs:
+            num_heads += len(aux_outputs['size_count_logits'])
+        if num_heads > 0:
+            aux_loss /= num_heads
 
     total = (loss_weights['rationale'] * rationale_loss +
              loss_weights['answer']    * answer_loss +
@@ -271,7 +261,7 @@ def train_with_curriculum(model, datasets, num_epochs=NUM_EPOCHS):
             logits, aux_outputs = model(images, inp, return_aux=True)
 
             loss, rat_loss, ans_loss, aux_loss = compute_weighted_loss(
-                logits, tgt, loss_mask, rat_mask, ans_mask,
+                logits, tgt, rat_mask, ans_mask,
                 aux_outputs, aux_labels, model.text_processor.tokenizer, loss_weights
             )
 

@@ -21,7 +21,7 @@ def get_model_stats(model):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     # Component-wise parameter counts
-    vision_params = sum(p.numel() for p in model.vision_encoder.parameters())
+    vision_params = sum(p.numel() for p in model.vision_token_encoder.parameters())
     text_embed_params = sum(p.numel() for p in model.token_embedding.parameters()) + \
                       sum(p.numel() for p in model.position_embedding.parameters())
     transformer_params = sum(p.numel() for p in model.transformer_blocks.parameters())
@@ -83,7 +83,7 @@ class ToyVLMGUI:
         self.history_index = -1
         
         # Image editing state
-        self.editing_mode = 'square'  # 'square', 'circle'
+        self.editing_mode = ObjType.SQUARE.value  # Default to square
         self.erase_mode = False
         self.tool_size = 10
         self.canvas_scale = 300  # Scale factor from 64x64 to display size
@@ -125,11 +125,11 @@ class ToyVLMGUI:
         shapes_frame = ttk.Frame(edit_frame)        
         shapes_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
         
-        self.tool_var = tk.StringVar(value='square')
+        self.tool_var = tk.StringVar(value=ObjType.SQUARE.value)
         ttk.Radiobutton(shapes_frame, text="Square", variable=self.tool_var, 
-                       value='square', command=self.on_tool_change).pack(side=tk.LEFT, padx=5)
+                       value=ObjType.SQUARE.value, command=self.on_tool_change).pack(side=tk.LEFT, padx=5)
         ttk.Radiobutton(shapes_frame, text="Circle", variable=self.tool_var, 
-                       value='circle', command=self.on_tool_change).pack(side=tk.LEFT, padx=5)
+                       value=ObjType.CIRCLE.value, command=self.on_tool_change).pack(side=tk.LEFT, padx=5)
         self.erase_var = tk.BooleanVar()
         ttk.Checkbutton(shapes_frame, text="Erase Mode", variable=self.erase_var, 
                        command=self.on_erase_change).pack(side=tk.RIGHT, padx=5)
@@ -399,9 +399,9 @@ class ToyVLMGUI:
         x1 = center_x - half_size; y1 = center_y - half_size;
         x2 = center_x + half_size; y2 = center_y + half_size;
 
-        if shape_type == 'square':
+        if shape_type == ObjType.SQUARE.value:
             draw.rectangle([x1, y1, x2, y2], fill=fill_color)
-        elif shape_type == 'circle':
+        elif shape_type == ObjType.CIRCLE.value:
             draw.ellipse([x1, y1, x2, y2], fill=fill_color)
 
         # Convert back to numpy array

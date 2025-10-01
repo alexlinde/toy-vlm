@@ -5,53 +5,55 @@ Handles creation of geometric shapes and related functionality.
 
 import numpy as np
 import random
+from enum import Enum
 from typing import List, Tuple, Dict, Any
 from PIL import Image
 
 # Image constants
 IMAGE_SIZE = 64
 
+class ObjType(Enum):
+    """Object type enumeration for shape classification."""
+    SQUARE = "square"
+    CIRCLE = "circle"
+    RECTANGLE = "rectangle"
+    CROSS = "cross"
+    TRIANGLE = "triangle"
+
+class ObjSize(Enum):
+    """Object size enumeration for shape classification."""
+    SMALL = "small"
+    MEDIUM = "medium"
+    LARGE = "large"
+
+SIZE_RANGES = {
+    ObjSize.SMALL: (8, 15),
+    ObjSize.MEDIUM: (16, 25),
+    ObjSize.LARGE: (26, 35)
+}
+
 class ShapeGenerator:
-    """Generates simple geometric shapes as images."""
+    """Generates simple geometric shapes as grayscale images."""
 
-    def __init__(self):
-        self.shapes = ['square', 'circle', 'rectangle', 'cross', 'triangle']
-        self.colors = ['red', 'green', 'blue']
-        self.sizes = ['small', 'medium', 'large']
-
-        # Size ranges for each category
-        self.size_ranges = {
-            'small': (8, 15),
-            'medium': (16, 25),
-            'large': (26, 35)
-        }
-
-        # RGB color values
-        self.color_values = {
-            'red': np.array([1.0, 0.0, 0.0]),
-            'green': np.array([0.0, 1.0, 0.0]),
-            'blue': np.array([0.0, 0.0, 1.0])
-        }
-    
-    def _draw_single_shape(self, img: np.ndarray, shape_type: str, size: int, cx: int, cy: int, color_vec: np.ndarray) -> Dict[str, Any]:
-        """Draw a single shape on the image and return its metadata."""
+    def _draw_single_shape(self, img: np.ndarray, shape_type: ObjType, size: int, cx: int, cy: int) -> Dict[str, Any]:
+        """Draw a single shape on the grayscale image and return its metadata."""
         # Create a temporary single-channel mask
         mask = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=bool)
 
-        if shape_type == 'square':
+        if shape_type == ObjType.SQUARE:
             x1, y1 = cx - size//2, cy - size//2
             x2, y2 = x1 + size, y1 + size
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(IMAGE_SIZE, x2), min(IMAGE_SIZE, y2)
             mask[y1:y2, x1:x2] = True
 
-        elif shape_type == 'circle':
+        elif shape_type == ObjType.CIRCLE:
             radius = size // 2
             yy, xx = np.ogrid[:IMAGE_SIZE, :IMAGE_SIZE]
             circle_mask = (xx - cx)**2 + (yy - cy)**2 <= radius**2
             mask = circle_mask
 
-        elif shape_type == 'rectangle':
+        elif shape_type == ObjType.RECTANGLE:
             width = int(size * random.uniform(0.6, 1.4))
             height = int(size * random.uniform(0.6, 1.4))
             x1, y1 = cx - width//2, cy - height//2
@@ -60,7 +62,7 @@ class ShapeGenerator:
             x2, y2 = min(IMAGE_SIZE, x2), min(IMAGE_SIZE, y2)
             mask[y1:y2, x1:x2] = True
 
-        elif shape_type == 'cross':
+        elif shape_type == ObjType.CROSS:
             thickness = max(2, size // 8)
             length = size // 2
             # Horizontal line
@@ -72,7 +74,7 @@ class ShapeGenerator:
             x1, x2 = max(0, cx - thickness), min(IMAGE_SIZE, cx + thickness)
             mask[y1:y2, x1:x2] = True
 
-        elif shape_type == 'triangle':
+        elif shape_type == ObjType.TRIANGLE:
             # Define three vertices of the triangle
             x1, y1 = cx, cy - size//2  # Top vertex
             x2, y2 = cx - size//2, cy + size//2  # Bottom left
@@ -89,12 +91,11 @@ class ShapeGenerator:
                         if a >= 0 and b >= 0 and c >= 0:
                             mask[yp, xp] = True
 
-        # Apply color to the mask
-        for c in range(3):
-            img[:, :, c][mask] = color_vec[c]
+        # Set white (255) for shape pixels in grayscale
+        img[mask] = 255
 
         metadata = {
-            'shape': shape_type,
+            'shape': shape_type.value,
             'size': size,
             'center_x': cx,
             'center_y': cy
@@ -102,18 +103,16 @@ class ShapeGenerator:
 
         return metadata
 
-    def generate_multi_shape_image(self, num_shapes: int = None, add_noise: bool = True) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
-        """Generate a 64x64 RGB image with multiple shapes and return metadata.
+    def generate_multi_shape_image(self, num_shapes: int, add_noise: bool) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+        """Generate a 64x64 grayscale image with multiple shapes and return metadata.
 
         Returns:
-            image: RGB numpy array of shape (64, 64, 3)
-            metadata_list: List of dicts containing shape info (shape, size, color, center_x, center_y)
+            image: Grayscale numpy array of shape (64, 64) with values 0-255
+            metadata_list: List of dicts containing shape info (shape, size, center_x, center_y)
         """
-        if num_shapes is None:
-            num_shapes = random.randint(2, 4)
 
-        # Initialize RGB image
-        img = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.float32)
+        # Initialize grayscale image (black background)
+        img = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=np.uint8)
         metadata_list = []
 
         # Track occupied regions to avoid too much overlap
@@ -125,13 +124,11 @@ class ShapeGenerator:
         while len(metadata_list) < num_shapes and attempts < max_attempts:
             attempts += 1
 
-            # Random shape, size, and color
-            shape_type = random.choice(self.shapes)
-            size_category = random.choice(self.sizes)
-            size_min, size_max = self.size_ranges[size_category]
+            # Random shape and size
+            shape_type = random.choice(list(ObjType))
+            size_category = random.choice(list(ObjSize))
+            size_min, size_max = SIZE_RANGES[size_category]
             size = random.randint(size_min, size_max)
-            color_name = random.choice(self.colors)
-            color_vec = self.color_values[color_name]
 
             # Random position with margin
             margin = size // 2 + 5
@@ -141,41 +138,37 @@ class ShapeGenerator:
             cx = random.randint(margin, IMAGE_SIZE - margin)
             cy = random.randint(margin, IMAGE_SIZE - margin)
 
-            # Check overlap (allow some overlap but not too much)
-            check_radius = size // 2
+            # Check overlap (no overlap allowed for clearer images)
+            check_radius = size // 2 + 3  # Add small margin
             y1, y2 = max(0, cy - check_radius), min(IMAGE_SIZE, cy + check_radius)
             x1, x2 = max(0, cx - check_radius), min(IMAGE_SIZE, cx + check_radius)
             overlap_ratio = occupied[y1:y2, x1:x2].sum() / max(1, (y2-y1) * (x2-x1))
 
-            if overlap_ratio > 0.3:  # Allow 30% overlap
+            if overlap_ratio > 0.0:  # No overlap allowed
                 continue
 
-            # Draw the shape
-            metadata = self._draw_single_shape(img, shape_type, size, cx, cy, color_vec)
-            metadata['color'] = color_name
-            metadata['size_category'] = size_category
+            # Draw the shape (grayscale - no color parameter)
+            metadata = self._draw_single_shape(img, shape_type, size, cx, cy)
+            metadata['size_category'] = size_category.value
             metadata_list.append(metadata)
 
             # Mark region as occupied
             occupied[y1:y2, x1:x2] = True
 
-        # Add slight noise
+        # Add slight noise (for grayscale, scale is 0-255)
         if add_noise:
-            noise = np.random.normal(0, 0.03, img.shape)
-            img = np.clip(img + noise, 0, 1)
+            noise = np.random.normal(0, 5, img.shape).astype(np.int16)
+            img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
         return img, metadata_list
 
 
     def get_available_shapes(self) -> List[str]:
         """Return list of available shape types."""
-        return self.shapes.copy()
+        return [shape.value for shape in ObjType]
 
-    def get_available_colors(self) -> List[str]:
-        """Return list of available colors."""
-        return self.colors.copy()
 
     def get_available_sizes(self) -> List[str]:
         """Return list of available size categories."""
-        return self.sizes.copy()
+        return [size.value for size in ObjSize]
 

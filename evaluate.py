@@ -70,9 +70,7 @@ class VLMEvaluator:
             question = sample['question']
             gt_answer = sample['ground_truth_answer']
 
-            # Convert numpy image to torch tensor if needed
-            if not isinstance(image, torch.Tensor):
-                image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
+            # Let generate_response handle image conversion and shaping
 
             # Generate prediction
             try:

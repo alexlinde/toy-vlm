@@ -1,6 +1,7 @@
 """
 Text processing module for the Toy VLM.
-Handles tokenization and text-related functionality.
+Updated to support prefixing image tokens in the sequence and
+multi-turn-friendly special tokens for user/assistant and reasoning spans.
 """
 
 import re
@@ -9,28 +10,33 @@ import os
 from typing import List, Set
 import torch
 
-# Token constants
-MAX_SEQ_LEN = 40  # Increased for reasoning scratchpad
+# Token/sequence constants
+# Increased to support prefixed image tokens (e.g., 64 tokens)
+MAX_SEQ_LEN = 128
 
 class SimpleTokenizer:
-    """Simple word-based tokenizer for the toy VLM."""
+    """Simple word-based tokenizer for the toy VLM (word-level)."""
     
     def __init__(self, vocab_file: str = None):
         if vocab_file and os.path.exists(vocab_file):
             # Load pretrained vocabulary
             self.load_vocab(vocab_file)
         else:
-            # Initialize with base vocabulary - will be extended during training
-            # Added special tokens for chain-of-thought reasoning
+            # Initialize with base vocabulary for dialog + image-token format
             self.vocab = {
                 '<PAD>': 0,
-                '<START>': 1,
-                '<END>': 2,
+                '<BOS>': 1,
+                '<EOS>': 2,
                 '<UNK>': 3,
-                '<Q>': 4,        # Question marker
-                '<REASON>': 5,   # Start of reasoning section
-                '<SEP>': 6,      # Separator between reasoning and answer
-                '<FINAL>': 7,    # Final answer marker
+                '<|user|>': 4,
+                '<|assistant|>': 5,
+                '<THINK>': 6,
+                '</THINK>': 7,
+                '<FINAL>': 8,
+                '</FINAL>': 9,
+                '<IMG_START>': 10,
+                '<IMG_END>': 11,
+                '<IMG>': 12,
             }
             self._update_mappings()
     
@@ -41,15 +47,22 @@ class SimpleTokenizer:
 
         # Special token IDs
         self.pad_token_id = self.vocab['<PAD>']
-        self.bos_token_id = self.vocab['<START>']
-        self.eos_token_id = self.vocab['<END>']
+        self.bos_token_id = self.vocab['<BOS>']
+        self.eos_token_id = self.vocab['<EOS>']
         self.unk_token_id = self.vocab['<UNK>']
 
-        # Reasoning special tokens
-        self.q_token_id = self.vocab.get('<Q>', self.unk_token_id)
-        self.reason_token_id = self.vocab.get('<REASON>', self.unk_token_id)
-        self.sep_token_id = self.vocab.get('<SEP>', self.unk_token_id)
-        self.final_token_id = self.vocab.get('<FINAL>', self.unk_token_id)
+        # Conversation and reasoning markers
+        self.user_token_id = self.vocab['<|user|>']
+        self.assistant_token_id = self.vocab['<|assistant|>']
+        self.think_start_id = self.vocab['<THINK>']
+        self.think_end_id = self.vocab['</THINK>']
+        self.final_start_id = self.vocab['<FINAL>']
+        self.final_end_id = self.vocab['</FINAL>']
+
+        # Image markers
+        self.img_start_id = self.vocab['<IMG_START>']
+        self.img_end_id = self.vocab['<IMG_END>']
+        self.img_token_id = self.vocab['<IMG>']
     
     def build_vocab_from_rationales(self, rationale_generator, num_samples=200):
         """Build vocabulary from RationaleGenerator for CoT reasoning."""
@@ -64,7 +77,7 @@ class SimpleTokenizer:
             for _ in range(num_samples // len(difficulties)):
                 try:
                     # Generate a multi-shape image
-                    image, metadata = shape_gen.generate_multi_shape_image()
+                    image, metadata = shape_gen.generate_multi_shape_image(1, False)
 
                     # Generate QA with rationale
                     question, answer, rationale = rationale_generator.generate_qa_with_rationale(
@@ -83,11 +96,10 @@ class SimpleTokenizer:
                 except Exception as e:
                     print(f"Warning: Could not generate QA with rationale: {e}")
                     continue
-
+        print(word_set)
         # Add common words that might be missing
         common_words = {
-            'shape', 'shapes', 'round', 'flat', 'big', 'small', 'object', 'figure',
-            'red', 'blue', 'green', 'white', 'black', 'color', 'size',
+            'shape', 'shapes', 'big', 'small', 'object', 'figure', 'size',
             'at', 'and', 'or', 'the', 'a', 'is', 'are', 'there', 'they',
             'count', 'found', 'compare', 'vs', 'greater', 'less', 'equal',
             'look', 'identify', 'zero', 'one', 'two', 'three', 'four',
@@ -196,62 +208,112 @@ class TextProcessor:
         answer: str = None,
         rationale: str = None,
         *,
-        mask_controls: bool = True  # mask <Q> and <REASON> if they are injected at inference
+        num_img_tokens: int = 64,
+        include_image: bool = True,
     ) -> tuple:
         """
-        Returns:
-            input_ids:  List[int]  = [<START>, q..., <Q>, <REASON>, r..., <SEP>, <FINAL>, a...]
-            target_ids: List[int]  = input_ids[1:] + [<END>]
-            loss_mask:  List[int]  = 0/1 per target position (same length as target_ids)
+        Compose sequence per new format:
+
+        input_ids  = [BOS] + [USER] + q_ids + img_block + [ASSIST]
+                     + [THINK] + r_ids + [THINK_END]
+                     + [FINAL] + a_ids + [FINAL_END] + [EOS]
+        target_ids = input_ids[1:] + [EOS]
         """
         tok = self.tokenizer
 
-        # --- Build input sequence ---
         q_tokens = tok.tokenize(question)
+        a_tokens = tok.tokenize(answer) if answer is not None else []
+        r_tokens = tok.tokenize(rationale) if rationale is not None else []
 
-        if answer is not None:
-            a_tokens = tok.tokenize(answer)
-            if rationale is not None:
-                r_tokens = tok.tokenize(rationale)
+        img_block: List[int] = []
+        if include_image and num_img_tokens > 0:
+            img_block = [tok.img_start_id] + [tok.img_token_id] * num_img_tokens + [tok.img_end_id]
 
-                # We inject <Q> and <REASON> into the prompt
-                input_ids = (
-                    [tok.bos_token_id] +
-                    q_tokens +
-                    [tok.q_token_id, tok.reason_token_id] +
-                    r_tokens +
-                    [tok.sep_token_id, tok.final_token_id] +
-                    a_tokens
-                )
+        input_ids = (
+            [tok.bos_token_id] +
+            [tok.user_token_id] + q_tokens +
+            img_block +
+            [tok.assistant_token_id] +
+            [tok.think_start_id] + r_tokens + [tok.think_end_id] +
+            [tok.final_start_id] + a_tokens + [tok.final_end_id] +
+            [tok.eos_token_id]
+        )
 
-                # Shifted targets
-                target_ids = input_ids[1:] + [tok.eos_token_id]
+        # Standard next-token targets: predict input_ids shifted by 1
+        target_ids = input_ids[1:]
 
-                # ----- Loss mask -----
-                # Positions (in targets) to ignore:
-                #   - predicting each question token  => len(q_tokens)
-                #   - optionally predicting <Q> and <REASON> if you inject them
-                ignore = len(q_tokens)
-                if mask_controls:
-                    ignore += 2  # <Q>, <REASON>
+        # Build span masks per policy (masks align to target_ids = input_ids[1:]):
+        # We supervise predictions of tokens strictly inside each span.
+        # - rat_mask: supervise predictions of rationale content tokens only
+        # - ans_mask: supervise predictions of answer content tokens only
+        rat_mask = [0] * len(target_ids)
+        ans_mask = [0] * len(target_ids)
 
-                loss_mask = [0] * ignore + [1] * (len(target_ids) - ignore)
+        # Supervision windows defined on source positions (k indexes input_ids[k] -> predicts input_ids[k+1])
+        def find_pos(tid):
+            try:
+                return input_ids.index(tid)
+            except ValueError:
+                return -1
 
-            else:
-                # Legacy: no rationale section
-                input_ids = [tok.bos_token_id] + q_tokens + a_tokens
-                target_ids = input_ids[1:] + [tok.eos_token_id]
+        th_s = find_pos(tok.think_start_id)
+        th_e = find_pos(tok.think_end_id)
+        fn_s = find_pos(tok.final_start_id)
+        fn_e = find_pos(tok.final_end_id)
 
-                # Mask only the question part in legacy mode
-                ignore = len(q_tokens)
-                loss_mask = [0] * ignore + [1] * (len(target_ids) - ignore)
-        else:
-            # Inference-only: no targets/mask
-            input_ids = [tok.bos_token_id] + q_tokens
-            target_ids = None
-            loss_mask = None
+        # Map to target positions: target[k] == input_ids[k+1]
+        # Supervise content tokens AND the closing tag for each span.
+        for k in range(len(target_ids)):
+            pred_idx = k + 1  # index into input_ids of the token being predicted
+            if th_s != -1 and th_e != -1 and th_s < pred_idx <= th_e:
+                rat_mask[k] = 1
+            if fn_s != -1 and fn_e != -1 and fn_s < pred_idx <= fn_e:
+                ans_mask[k] = 1
 
-        return input_ids, target_ids, loss_mask
+        # Diagnostics and structural assertions
+        # Ensure marker order and presence
+        def find_pos(tid):
+            try:
+                return input_ids.index(tid)
+            except ValueError:
+                return -1
+
+        bos_p = 0 if len(input_ids) > 0 and input_ids[0] == tok.bos_token_id else -1
+        usr_p = find_pos(tok.user_token_id)
+        asst_p = find_pos(tok.assistant_token_id)
+        th_s = find_pos(tok.think_start_id)
+        th_e = find_pos(tok.think_end_id)
+        fn_s = find_pos(tok.final_start_id)
+        fn_e = find_pos(tok.final_end_id)
+        eos_p = len(input_ids)-1 if len(input_ids) and input_ids[-1] == tok.eos_token_id else -1
+
+        assert bos_p == 0, "[text] <BOS> must be at position 0"
+        assert usr_p > 0, "[text] Missing <|user|>"
+        if include_image and num_img_tokens > 0:
+            img_s = find_pos(tok.img_start_id)
+            img_e = find_pos(tok.img_end_id)
+            assert img_s > usr_p and img_e > img_s, "[text] Invalid image block order"
+            # Check placeholders count
+            num_placeholders = sum(1 for t in input_ids if t == tok.img_token_id)
+            assert num_placeholders == num_img_tokens, f"[text] Expected {num_img_tokens} <IMG> tokens, found {num_placeholders}"
+        assert asst_p > usr_p, "[text] <|assistant|> must come after <|user|>"
+        # THINK and FINAL sections exist even if empty strings were passed (they may be contiguous)
+        assert th_s > asst_p and th_e > th_s, "[text] Invalid THINK span"
+        assert fn_s > th_e and fn_e > fn_s, "[text] Invalid FINAL span"
+        assert eos_p == len(input_ids)-1, "[text] <EOS> must be final token"
+
+        # Mask policy sanity: special markers must be unsupervised
+        special_set = {
+            tok.bos_token_id, tok.user_token_id, tok.assistant_token_id,
+            tok.think_start_id, tok.think_end_id, tok.final_start_id, tok.final_end_id,
+            tok.eos_token_id, tok.img_start_id, tok.img_end_id, tok.img_token_id
+        }
+        allowed_special_to_supervise = {tok.think_end_id, tok.final_end_id}
+        for k, tid in enumerate(target_ids):
+            if tid in special_set and tid not in allowed_special_to_supervise:
+                assert rat_mask[k] == 0 and ans_mask[k] == 0, f"[text] Mask error: supervising special token id={tid} at k={k}"
+
+        return input_ids, target_ids, rat_mask, ans_mask
 
     def pad_sequence(self, tokens, max_length=MAX_SEQ_LEN):
         pad_id = self.tokenizer.pad_token_id
