@@ -13,8 +13,9 @@ from typing import Dict, List, Any
 import argparse
 from shapes import ShapeGenerator, ObjType
 from questions import RationaleGenerator
-from text import TextProcessor, MAX_SEQ_LEN
+from text import TextProcessor, MAX_SEQ_LEN, NUM_IMG_TOKENS
 from model import ToyVLM, DEVICE
+from utils_loss import compute_weighted_loss
 import random
 
 # Training constants
@@ -115,52 +116,7 @@ def get_loss_weights(epoch: int) -> Dict[str, float]:
         return {'rationale': 0.5, 'answer': 4.0, 'aux': 0.2}
 
 
-def compute_weighted_loss(
-    logits, target_tokens, rat_mask, ans_mask,
-    aux_outputs, aux_labels, tokenizer, loss_weights
-):
-    V = tokenizer.get_vocab_size()
-    # CE per token
-    ce = F.cross_entropy(
-        logits.reshape(-1, V),
-        target_tokens.reshape(-1),
-        ignore_index=tokenizer.pad_token_id,
-        label_smoothing=0.1,
-        reduction='none'
-    ).view(target_tokens.size(0), -1)
-
-    # masks: [B,T] float {0,1}
-    def masked_mean(x, m):
-        denom = m.sum().clamp_min(1.0)
-        return (x * m).sum() / denom
-
-    # components
-    rationale_loss = masked_mean(ce, rat_mask)
-    answer_loss    = masked_mean(ce, ans_mask)
-
-    # aux (counts)
-    aux_loss = 0.0
-
-    # Shape count losses
-    for shape, head_logits in aux_outputs['count_logits'].items():
-        targets = torch.tensor([al['counts'][shape] for al in aux_labels],
-                                device=head_logits.device, dtype=torch.long)
-        aux_loss += F.cross_entropy(head_logits, targets)
-
-    # Size count losses
-    for size, head_logits in aux_outputs['size_count_logits'].items():
-        targets = torch.tensor([al['size_counts'][size] for al in aux_labels],
-                                device=head_logits.device, dtype=torch.long)
-        aux_loss += F.cross_entropy(head_logits, targets)
-
-    # Normalize by number of heads that contributed
-    aux_loss /= (len(aux_outputs['count_logits']) + len(aux_outputs['size_count_logits']))
-
-    total = (loss_weights['rationale'] * rationale_loss +
-             loss_weights['answer']    * answer_loss +
-             loss_weights['aux']       * aux_loss)
-
-    return total, rationale_loss, answer_loss, aux_loss
+## compute_weighted_loss is shared in utils_loss.compute_weighted_loss
 
 
 def create_curriculum_datasets(text_processor, samples_per_epoch=10000):
@@ -306,7 +262,7 @@ def main():
     print(f"Vocabulary size: {text_processor.tokenizer.get_vocab_size()}")
 
     # Create model with the built tokenizer
-    model = ToyVLM(text_processor, num_layers=6)  # Increased layers for reasoning
+    model = ToyVLM(text_processor)
 
     # Create curriculum datasets
     print("\nCreating curriculum datasets...")

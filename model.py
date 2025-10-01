@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-from text import MAX_SEQ_LEN, TextProcessor
+from text import MAX_SEQ_LEN, NUM_IMG_TOKENS, TextProcessor
 from shapes import ObjType, ObjSize
 
 # Model constants - device fallback
@@ -20,7 +20,7 @@ else:
     DEVICE = torch.device('cpu')
 HIDDEN_DIM = 256
 NUM_HEADS = 4
-NUM_LAYERS = 4
+NUM_LAYERS = 6
 
 class VisionTokenEncoder(nn.Module):
     """Tiny CNN -> 8x8 grid tokens -> linear to hidden_dim. Minimal for toy VLM."""
@@ -56,11 +56,21 @@ class VisionTokenEncoder(nn.Module):
         # Add 2D positional encoding
         x = x + self.pos_embed_2d
 
-        # Flatten to tokens (B, 64, C)
-        B, C, H, W = x.shape
+        # Downsample 8x8 -> GxG where G^2 == NUM_IMG_TOKENS, then flatten to tokens
+        B, C, H, W = x.shape  # expected 8x8
+        if H * W != NUM_IMG_TOKENS:
+            G = int(math.sqrt(NUM_IMG_TOKENS))
+            assert G * G == NUM_IMG_TOKENS, f"NUM_IMG_TOKENS must be a perfect square, got {NUM_IMG_TOKENS}"
+            assert H % G == 0 and W % G == 0, f"Cannot pool from {H}x{W} to {G}x{G}"
+            k_h = H // G
+            k_w = W // G
+            x = F.avg_pool2d(x, kernel_size=(k_h, k_w), stride=(k_h, k_w))  # (B,C,G,G)
+            H, W = G, G
+
+        # Flatten to tokens (B, NUM_IMG_TOKENS, C)
         tokens = x.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
 
-        # Project to hidden_dim -> (B, 64, hidden_dim)
+        # Project to hidden_dim -> (B, NUM_IMG_TOKENS, hidden_dim)
         tokens = self.proj(tokens)
         tokens = F.layer_norm(tokens, (self.hidden_dim,))
         assert torch.isfinite(tokens).all(), "[model] NaN/Inf in vision tokens"
@@ -195,30 +205,27 @@ class AuxiliaryHeads(nn.Module):
 class ToyVLM(nn.Module):
     """Vision-Language Model that prefixes image tokens into the text sequence."""
 
-    def __init__(self, text_processor=None, hidden_dim=HIDDEN_DIM, num_heads=NUM_HEADS, num_layers=NUM_LAYERS):
+    def __init__(self, text_processor):
         super().__init__()
 
         # Vision token encoder (produces 8x8 -> 64 tokens at hidden_dim)
-        self.vision_token_encoder = VisionTokenEncoder(hidden_dim=hidden_dim)
+        self.vision_token_encoder = VisionTokenEncoder(HIDDEN_DIM)
 
-        # Initialize text processor if not provided
-        if text_processor is None:
-            text_processor = TextProcessor()
         self.text_processor = text_processor
         vocab_size = text_processor.tokenizer.get_vocab_size()
 
         # Text embeddings
-        self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.position_embedding = nn.Embedding(MAX_SEQ_LEN, hidden_dim)
+        self.token_embedding = nn.Embedding(vocab_size, HIDDEN_DIM)
+        self.position_embedding = nn.Embedding(MAX_SEQ_LEN, HIDDEN_DIM)
 
         # Type embeddings for text and vision tokens
-        self.text_type = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        self.vision_type = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        self.input_norm = nn.LayerNorm(hidden_dim)
+        self.text_type = nn.Parameter(torch.zeros(1, 1, HIDDEN_DIM))
+        self.vision_type = nn.Parameter(torch.zeros(1, 1, HIDDEN_DIM))
+        self.input_norm = nn.LayerNorm(HIDDEN_DIM)
 
         # Transformer decoder (self-attention only)
         self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(hidden_dim, num_heads) for _ in range(num_layers)
+            TransformerBlock(HIDDEN_DIM, NUM_HEADS) for _ in range(NUM_LAYERS)
         ])
         self.dropout = nn.Dropout(0.1)
 
@@ -230,8 +237,8 @@ class ToyVLM(nn.Module):
                     nn.init.zeros_(m.bias)
 
         # build modules
-        self.output_projection = nn.Linear(hidden_dim, vocab_size)
-        self.auxiliary_heads = AuxiliaryHeads(hidden_dim)
+        self.output_projection = nn.Linear(HIDDEN_DIM, vocab_size)
+        self.auxiliary_heads = AuxiliaryHeads(HIDDEN_DIM)
 
         # init *before* tying
         self.apply(_init_weights)  # only touches Linear/Conv, not Embedding
@@ -247,7 +254,7 @@ class ToyVLM(nn.Module):
         return mask == 0
     
     def encode_image_tokens(self, images):
-        """Encode image into a sequence of visual tokens [batch, N, hidden_dim]."""
+        """Encode image into exactly NUM_IMG_TOKENS visual tokens [B, N, H]."""
         return self.vision_token_encoder(images)
 
     def forward_with_embeds(self, input_embeds):
@@ -271,26 +278,12 @@ class ToyVLM(nn.Module):
 
         # 3) Replace <IMG> placeholder embeddings with visual tokens in order
         tok = self.text_processor.tokenizer
-        img_id = tok.img_token_id
         for b in range(batch_size):
-            img_positions = (input_tokens[b] == img_id).nonzero(as_tuple=True)[0]
+            img_positions = (input_tokens[b] == tok.img_token_id).nonzero(as_tuple=True)[0]
             n = img_positions.numel()
-            if n <= 0:
-                continue
-            # Resample img_tokens to exactly n tokens via 2x2 average pooling into 4x4 (=16) or strides
-            btok = img_tokens[b:b+1]  # [1, 64, H]
-            Hdim = btok.size(-1)
-            if btok.size(1) == 64 and n == 16:
-                # reshape to 8x8, pool 2x2 -> 4x4
-                grid = btok.view(1, 8, 8, Hdim).permute(0, 3, 1, 2)  # [1,H,8,8]
-                pooled = F.avg_pool2d(grid, kernel_size=2, stride=2)  # [1,H,4,4]
-                vtoks = pooled.permute(0, 2, 3, 1).contiguous().view(1, 16, Hdim)
-            elif btok.size(1) == 64 and n == 64:
-                vtoks = btok
-            else:
-                idx = torch.linspace(0, btok.size(1)-1, steps=n, device=btok.device).round().long()
-                vtoks = btok[:, idx, :]
-            token_embeds[b, img_positions, :] = vtoks[0]
+            assert n == NUM_IMG_TOKENS, f"expected {NUM_IMG_TOKENS} image tokens, got {n}"
+            btok = img_tokens[b:b+1]  # [1, NUM_IMG_TOKENS, H]
+            token_embeds[b, img_positions, :] = btok[0]
             # Add vision type embedding to image token positions
             token_embeds[b, img_positions, :] = token_embeds[b, img_positions, :] + self.vision_type
 
@@ -355,7 +348,7 @@ def generate_response(model, image, question, max_length=35, return_rationale=Tr
     # Build prompt tokens
     # Use allow_unk=True for free-form questions
     q_ids = tok.tokenize(question, allow_unk=True)
-    num_img_tokens = 16
+    num_img_tokens = NUM_IMG_TOKENS
     img_block = [tok.img_start_id] + [tok.img_token_id] * num_img_tokens + [tok.img_end_id]
     input_ids = [tok.bos_token_id] + [tok.user_token_id] + q_ids + img_block + [tok.assistant_token_id] + [tok.think_start_id]
 

@@ -14,6 +14,8 @@ import threading
 from shapes import ShapeGenerator
 from text import SimpleTokenizer, TextProcessor
 from model import ToyVLM, DEVICE, generate_response
+from shapes import ObjType, ObjSize
+import random
 
 def get_model_stats(model):
     """Get comprehensive model statistics."""
@@ -64,7 +66,7 @@ class ToyVLMGUI:
         self.text_processor.tokenizer = self.tokenizer
 
         # Initialize model components (with CoT support: 6 layers)
-        self.model = ToyVLM(self.text_processor, num_layers=6,)
+        self.model = ToyVLM(self.text_processor)
         self.model.load_state_dict(torch.load(model_path, map_location=DEVICE))
         self.model.to(DEVICE)
         self.model.eval()
@@ -131,8 +133,11 @@ class ToyVLMGUI:
         ttk.Radiobutton(shapes_frame, text="Circle", variable=self.tool_var, 
                        value=ObjType.CIRCLE.value, command=self.on_tool_change).pack(side=tk.LEFT, padx=5)
         self.erase_var = tk.BooleanVar()
+        self.noise_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(shapes_frame, text="Erase Mode", variable=self.erase_var, 
                        command=self.on_erase_change).pack(side=tk.RIGHT, padx=5)
+        # Noise checkbox
+        ttk.Checkbutton(shapes_frame, text="Add Noise", variable=self.noise_var).pack(side=tk.RIGHT, padx=5)
         
         # Size slider
         size_frame = ttk.Frame(edit_frame)
@@ -233,12 +238,15 @@ class ToyVLMGUI:
     def generate_new_shape(self):
         """Generate a new multi-shape RGB image and update the display."""
         # Generate multi-shape RGB image with metadata
-        self.current_image, self.current_metadata = self.shape_generator.generate_multi_shape_image(add_noise=False)
+        num_shapes = random.randint(1, 4)
+        self.current_image, self.current_metadata = self.shape_generator.generate_multi_shape_image(
+            num_shapes, add_noise=bool(self.noise_var.get())
+        )
         self.update_canvas_display()
 
         # Display shape info in chat
         shape_info = f"Generated {len(self.current_metadata)} shapes: "
-        shape_summary = [f"{m['color']} {m['size_category']} {m['shape']}" for m in self.current_metadata]
+        shape_summary = [f"{m['size_category']} {m['shape']}" for m in self.current_metadata]
         shape_info += ", ".join(shape_summary)
         # self.add_to_chat(shape_info, "System")
     
@@ -246,12 +254,12 @@ class ToyVLMGUI:
         """Update the canvas with the current image."""
         # Convert numpy array to PIL Image and then to PhotoImage
         # Handle both RGB (H, W, 3) and grayscale (H, W) images
-        img_array = (self.current_image * 255).astype(np.uint8)
-
-        if img_array.ndim == 3:  # RGB image
-            pil_img = Image.fromarray(img_array, mode='RGB')
-        else:  # Grayscale image
-            pil_img = Image.fromarray(img_array, mode='L')
+        img_array = self.current_image
+        if img_array.dtype != np.uint8:
+            img_uint8 = np.clip(img_array * 255.0, 0, 255).astype(np.uint8)
+        else:
+            img_uint8 = img_array
+        pil_img = Image.fromarray(img_uint8, mode='L')
 
         self.img_size = pil_img.size
         pil_img = pil_img.resize((self.canvas_scale, self.canvas_scale), Image.NEAREST)  # Scale up with nearest neighbor
@@ -319,8 +327,8 @@ class ToyVLMGUI:
     
     def _process_question(self, question):
         """Process the question in a background thread."""
-        # Convert numpy array (H, W, C) to torch tensor (C, H, W)
-        image_tensor = torch.from_numpy(self.current_image).permute(2, 0, 1).float()
+        # Convert numpy array to torch tensor in (C,H,W)
+        image_tensor = torch.from_numpy(self.current_image).unsqueeze(0).float() / 255.0
 
         # Generate response with chain-of-thought
         rationale, answer = generate_response(self.model, image_tensor, question,
@@ -382,18 +390,7 @@ class ToyVLMGUI:
         """Draw or erase a shape at the specified position using Pillow."""
         # Convert numpy array to PIL Image
         img_array = (self.current_image * 255).astype(np.uint8)
-
-        # Handle RGB vs grayscale
-        if img_array.ndim == 3:
-            pil_img = Image.fromarray(img_array, mode='RGB')
-            # For RGB, use white for draw, black for erase
-            if fill_color == 255:
-                fill_color = (255, 255, 255)
-            else:
-                fill_color = (0, 0, 0)
-        else:
-            pil_img = Image.fromarray(img_array, mode='L')
-
+        pil_img = Image.fromarray(img_array, mode='L')
         draw = ImageDraw.Draw(pil_img)
         half_size = size // 2
         x1 = center_x - half_size; y1 = center_y - half_size;

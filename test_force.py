@@ -2,9 +2,10 @@ import torch
 import torch.nn.functional as F
 from typing import List, Dict, Tuple
 import numpy as np
-from text import TextProcessor, MAX_SEQ_LEN, SimpleTokenizer
+from text import TextProcessor, MAX_SEQ_LEN, NUM_IMG_TOKENS, SimpleTokenizer
+from utils_loss import compute_weighted_loss
 from model import ToyVLM, DEVICE, generate_response
-from shapes import ShapeGenerator, ObjType, ObjSize
+from shapes import ShapeGenerator, ObjType, ObjSize, SIZE_RANGES
 from questions import RationaleGenerator
 import os
 import random
@@ -12,26 +13,26 @@ import random
 
 def build_examples(tp: TextProcessor, num_examples: int = 8) -> List[Dict]:
     sg = ShapeGenerator()
-    import numpy as np
-
     examples: List[Dict] = []
 
-    def random_center(size: int) -> tuple:
-        margin = size // 2 + 5
-        cx = random.randint(margin, 64 - margin)
-        cy = random.randint(margin, 64 - margin)
-        return cx, cy
-
     for _ in range(num_examples):
-        shape = random.choice(list(ObjType))
-        not_shape = random.choice([e for e in ObjType if e != shape])
-        img_np = np.zeros((64, 64), dtype=np.uint8)
-        size = random.randint(12, 28)
-        cx, cy = random_center(size)
-        sg._draw_single_shape(img_np, shape, size=size, cx=cx, cy=cy)
+        img_np, meta = sg.generate_multi_shape_image(num_shapes=1, add_noise=True)
+        # metadata for single shape
+        m = meta[0]
+        shape_present = m['shape']
+        size_cat = m.get('size_category')
         img = torch.tensor(img_np, dtype=torch.float32).unsqueeze(0) / 255.0
+
+        # derive aux labels from metadata
+        aux_counts = {e.value: 0 for e in ObjType}
+        aux_counts[shape_present] = 1
+        aux_size_counts = {e.value: 0 for e in ObjSize}
+        if size_cat in aux_size_counts:
+            aux_size_counts[size_cat] = 1
+
+        # positive example (shape present)
         inp, tgt, rat_m, ans_m = tp.prepare_input_sequence(
-            f"is there a {shape.value}", answer="yes", rationale=f"count {shape.value} is 1", num_img_tokens=16, include_image=True
+            f"is there a {shape_present}", answer="yes", rationale=f"count {shape_present} is 1"
         )
         inp = tp.pad_sequence(inp, MAX_SEQ_LEN)
         tgt = tp.pad_sequence(tgt, MAX_SEQ_LEN)
@@ -44,11 +45,15 @@ def build_examples(tp: TextProcessor, num_examples: int = 8) -> List[Dict]:
             'rat_mask': torch.tensor(rat_m, dtype=torch.float32),
             'ans_mask': torch.tensor(ans_m, dtype=torch.float32),
             'expected_answer': 'yes',
-            'question': f"is there a {shape.value}",
+            'question': f"is there a {shape_present}",
+            'aux_labels': {'counts': aux_counts, 'size_counts': aux_size_counts},
         })
 
+        # negative example (different shape not present)
+        present_enum = ObjType(shape_present)
+        not_shape = random.choice([e for e in ObjType if e != present_enum])
         inp, tgt, rat_m, ans_m = tp.prepare_input_sequence(
-            f"is there a {not_shape.value}", answer="no", rationale=f"count {not_shape.value} is 0", num_img_tokens=16, include_image=True
+            f"is there a {not_shape.value}", answer="no", rationale=f"count {not_shape.value} is 0"
         )
         inp = tp.pad_sequence(inp, MAX_SEQ_LEN)
         tgt = tp.pad_sequence(tgt, MAX_SEQ_LEN)
@@ -62,6 +67,7 @@ def build_examples(tp: TextProcessor, num_examples: int = 8) -> List[Dict]:
             'ans_mask': torch.tensor(ans_m, dtype=torch.float32),
             'expected_answer': 'no',
             'question': f"is there a {not_shape.value}",
+            'aux_labels': {'counts': aux_counts, 'size_counts': aux_size_counts},
         })
 
     return examples
@@ -71,6 +77,8 @@ def overfit(model: ToyVLM, examples: List[Dict], iters: int = 200, lr: float = 3
     model.train().to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     tok = model.text_processor.tokenizer
+    # Match train schedule for weights
+    loss_weights = {'rationale': 1.0, 'answer': 2.0, 'aux': 0.5}
 
     for i in range(iters):
         total = 0.0
@@ -86,15 +94,14 @@ def overfit(model: ToyVLM, examples: List[Dict], iters: int = 200, lr: float = 3
             # Structural assertions per-batch
             assert inp.size(1) == MAX_SEQ_LEN, "[test] Input must be padded to MAX_SEQ_LEN"
             # Run forward
-            logits = model(img, inp, return_aux=False)
+            logits, aux_outputs = model(img, inp, return_aux=True)
             V = tok.get_vocab_size()
-            ce = F.cross_entropy(
-                logits.reshape(-1, V),
-                tgt.reshape(-1),
-                ignore_index=tok.pad_token_id,
-                reduction='none'
-            ).view_as(tgt)
-            loss = (ce * msk).sum() / msk.sum().clamp_min(1.0)
+            # Use generated aux labels
+            aux_labels = [ex['aux_labels']]
+            loss, rat_loss, ans_loss, aux_loss = compute_weighted_loss(
+                logits, tgt, ex['rat_mask'].unsqueeze(0).to(DEVICE), ex['ans_mask'].unsqueeze(0).to(DEVICE),
+                aux_outputs, aux_labels, tok, loss_weights
+            )
 
             opt.zero_grad()
             loss.backward()
@@ -103,7 +110,13 @@ def overfit(model: ToyVLM, examples: List[Dict], iters: int = 200, lr: float = 3
             total += loss.item()
             total_mask_sum += float(msk.sum().item())
             # collect supervised CE values for diagnostics
-            sup_vals = ce[msk.bool()]
+            ce_full = F.cross_entropy(
+                logits.reshape(-1, V),
+                tgt.reshape(-1),
+                ignore_index=tok.pad_token_id,
+                reduction='none'
+            ).view_as(tgt)
+            sup_vals = ce_full[msk.bool()]
             if sup_vals.numel() > 0:
                 sup_ce_all.append(sup_vals.detach().flatten())
         if (i+1) % 50 == 0:
@@ -169,12 +182,6 @@ def verify_teacher_forcing(model: ToyVLM, examples: List[Dict]) -> bool:
     return ok
 
 
-def set_zero_dropout(model: ToyVLM) -> None:
-    for m in model.modules():
-        if isinstance(m, torch.nn.Dropout):
-            m.p = 0.0
-
-
 def print_vision_token_diagnostics(model: ToyVLM, exs: List[Dict]) -> None:
     # Ensure model and tensors are on the same device
     model.to(DEVICE)
@@ -182,19 +189,11 @@ def print_vision_token_diagnostics(model: ToyVLM, exs: List[Dict]) -> None:
     with torch.no_grad():
         img_c = exs[0]['image'].unsqueeze(0).to(DEVICE)
         img_s = exs[2]['image'].unsqueeze(0).to(DEVICE)
-        toks_c = model.encode_image_tokens(img_c)  # [1,64,H]
-        toks_s = model.encode_image_tokens(img_s)  # [1,64,H]
-        H = toks_c.size(-1)
-        # pool 8x8 -> 4x4 tokens
-        def pool16(x):
-            grid = x.view(1, 8, 8, H).permute(0, 3, 1, 2)
-            pooled = F.avg_pool2d(grid, kernel_size=2, stride=2)  # [1,H,4,4]
-            return pooled.permute(0, 2, 3, 1).contiguous().view(1, 16, H)
-        p_c = pool16(toks_c)
-        p_s = pool16(toks_s)
-        # Compare means and cosine
-        v_c = p_c.mean(dim=1)  # [1,H]
-        v_s = p_s.mean(dim=1)  # [1,H]
+        toks_c = model.encode_image_tokens(img_c)  # [1,N,H]
+        toks_s = model.encode_image_tokens(img_s)  # [1,N,H]
+        # Compare means and cosine directly over fixed NUM_IMG_TOKENS
+        v_c = toks_c.mean(dim=1)  # [1,H]
+        v_s = toks_s.mean(dim=1)  # [1,H]
         cos = torch.nn.functional.cosine_similarity(v_c, v_s).item()
         l2 = torch.norm(v_c - v_s).item()
         print(f"Vision diagnostics: pooled mean L2={l2:.4f}, cosine={cos:.4f}")
@@ -208,7 +207,7 @@ def build_dataset_examples(tp: TextProcessor, num_samples: int = 50, difficulty:
         num_shapes = random.randint(1, 4)
         img_np, metadata = sg.generate_multi_shape_image(num_shapes, True)
         q, a, r = rg.generate_qa_with_rationale(metadata, difficulty=difficulty)
-        inp, tgt, rat_m, ans_m = tp.prepare_input_sequence(q, a, r, num_img_tokens=num_img_tokens, include_image=True)
+        inp, tgt, rat_m, ans_m = tp.prepare_input_sequence(q, a, r)
         inp = tp.pad_sequence(inp, MAX_SEQ_LEN)
         tgt = tp.pad_sequence(tgt, MAX_SEQ_LEN)
         rat_m = tp.pad_sequence(rat_m, MAX_SEQ_LEN)

@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple
 from tqdm import tqdm
 from shapes import ShapeGenerator
 from questions import RationaleGenerator
-from text import TextProcessor, SimpleTokenizer
+from text import TextProcessor, SimpleTokenizer, NUM_IMG_TOKENS
 from model import ToyVLM, generate_response, DEVICE
 import random
 
@@ -174,7 +174,7 @@ def main():
     text_processor.tokenizer = tokenizer
 
     # Create model
-    model = ToyVLM(text_processor, num_layers=6)
+    model = ToyVLM(text_processor)
 
     # Load trained weights
     try:

@@ -11,8 +11,9 @@ from typing import List, Set
 import torch
 
 # Token/sequence constants
-# Increased to support prefixed image tokens (e.g., 64 tokens)
+# Increased to support prefixed image tokens
 MAX_SEQ_LEN = 128
+NUM_IMG_TOKENS = 16
 
 class SimpleTokenizer:
     """Simple word-based tokenizer for the toy VLM (word-level)."""
@@ -206,10 +207,7 @@ class TextProcessor:
         self,
         question: str,
         answer: str = None,
-        rationale: str = None,
-        *,
-        num_img_tokens: int = 64,
-        include_image: bool = True,
+        rationale: str = None
     ) -> tuple:
         """
         Compose sequence per new format:
@@ -225,9 +223,7 @@ class TextProcessor:
         a_tokens = tok.tokenize(answer) if answer is not None else []
         r_tokens = tok.tokenize(rationale) if rationale is not None else []
 
-        img_block: List[int] = []
-        if include_image and num_img_tokens > 0:
-            img_block = [tok.img_start_id] + [tok.img_token_id] * num_img_tokens + [tok.img_end_id]
+        img_block = [tok.img_start_id] + [tok.img_token_id] * NUM_IMG_TOKENS + [tok.img_end_id]
 
         input_ids = (
             [tok.bos_token_id] +
@@ -289,13 +285,12 @@ class TextProcessor:
 
         assert bos_p == 0, "[text] <BOS> must be at position 0"
         assert usr_p > 0, "[text] Missing <|user|>"
-        if include_image and num_img_tokens > 0:
-            img_s = find_pos(tok.img_start_id)
-            img_e = find_pos(tok.img_end_id)
-            assert img_s > usr_p and img_e > img_s, "[text] Invalid image block order"
-            # Check placeholders count
-            num_placeholders = sum(1 for t in input_ids if t == tok.img_token_id)
-            assert num_placeholders == num_img_tokens, f"[text] Expected {num_img_tokens} <IMG> tokens, found {num_placeholders}"
+        img_s = find_pos(tok.img_start_id)
+        img_e = find_pos(tok.img_end_id)
+        assert img_s > usr_p and img_e > img_s, "[text] Invalid image block order"
+        # Check placeholders count
+        num_placeholders = sum(1 for t in input_ids if t == tok.img_token_id)
+        assert num_placeholders == NUM_IMG_TOKENS, f"[text] Expected {NUM_IMG_TOKENS} <IMG> tokens, found {num_placeholders}"
         assert asst_p > usr_p, "[text] <|assistant|> must come after <|user|>"
         # THINK and FINAL sections exist even if empty strings were passed (they may be contiguous)
         assert th_s > asst_p and th_e > th_s, "[text] Invalid THINK span"
