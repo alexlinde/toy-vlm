@@ -86,26 +86,19 @@ class ShapeDataset(Dataset):
 
     def _generate_aux_labels(self, metadata_list: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Generate ground truth labels for auxiliary heads."""
-        shape_to_idx = {obj_type.value: idx for idx, obj_type in enumerate(ObjType)}
-        shape_to_idx['background'] = len(ObjType)
-        size_to_idx = {'small': 0, 'medium': 1, 'large': 2}
-
         # Count each shape type (for count heads)
         shape_counts = {obj_type.value: 0 for obj_type in ObjType}
+
         # Count each size category
         size_counts = {size: 0 for size in ['small', 'medium', 'large']}
+
         for m in metadata_list:
             shape_counts[m['shape']] += 1
-            sc = m.get('size_category')
-            if sc in size_counts:
-                size_counts[sc] += 1
-
-        count_labels = {shape: min(count, 4) for shape, count in shape_counts.items()}  # Cap at 4
-        size_count_labels = {sz: min(count, 4) for sz, count in size_counts.items()}    # Cap at 4
-
+            size_counts[m['size_category']] += 1
+                
         return {
-            'counts': count_labels,
-            'size_counts': size_count_labels,
+            'counts': shape_counts,
+            'size_counts': size_counts,
         }
 
 def get_loss_weights(epoch: int) -> Dict[str, float]:
@@ -147,27 +140,21 @@ def compute_weighted_loss(
 
     # aux (counts)
     aux_loss = 0.0
-    if aux_outputs is not None:
-        # Shape count losses
-        if 'count_logits' in aux_outputs:
-            for shape, head_logits in aux_outputs['count_logits'].items():
-                targets = torch.tensor([al['counts'][shape] for al in aux_labels],
-                                       device=head_logits.device, dtype=torch.long)
-                aux_loss += F.cross_entropy(head_logits, targets)
-        # Size count losses
-        if 'size_count_logits' in aux_outputs:
-            for size, head_logits in aux_outputs['size_count_logits'].items():
-                targets = torch.tensor([al['size_counts'][size] for al in aux_labels],
-                                       device=head_logits.device, dtype=torch.long)
-                aux_loss += F.cross_entropy(head_logits, targets)
-        # Normalize by number of heads that contributed
-        num_heads = 0
-        if 'count_logits' in aux_outputs:
-            num_heads += len(aux_outputs['count_logits'])
-        if 'size_count_logits' in aux_outputs:
-            num_heads += len(aux_outputs['size_count_logits'])
-        if num_heads > 0:
-            aux_loss /= num_heads
+
+    # Shape count losses
+    for shape, head_logits in aux_outputs['count_logits'].items():
+        targets = torch.tensor([al['counts'][shape] for al in aux_labels],
+                                device=head_logits.device, dtype=torch.long)
+        aux_loss += F.cross_entropy(head_logits, targets)
+
+    # Size count losses
+    for size, head_logits in aux_outputs['size_count_logits'].items():
+        targets = torch.tensor([al['size_counts'][size] for al in aux_labels],
+                                device=head_logits.device, dtype=torch.long)
+        aux_loss += F.cross_entropy(head_logits, targets)
+
+    # Normalize by number of heads that contributed
+    aux_loss /= (len(aux_outputs['count_logits']) + len(aux_outputs['size_count_logits']))
 
     total = (loss_weights['rationale'] * rationale_loss +
              loss_weights['answer']    * answer_loss +

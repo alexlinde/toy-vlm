@@ -409,10 +409,6 @@ def generate_response(model, image, question, max_length=35, return_rationale=Tr
             break
         answer_tokens.append(nxt)
         input_ids.append(nxt)
-        # For binary answers, often one token is enough
-        ans_str = tok.decode([nxt], skip_special_tokens=True)
-        if ans_str in ("yes", "no"):
-            break
 
     # Ensure closing </FINAL> and <EOS>
     if not (len(input_ids) and input_ids[-1] == tok.final_end_id):

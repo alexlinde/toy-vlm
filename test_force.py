@@ -2,58 +2,67 @@ import torch
 import torch.nn.functional as F
 from typing import List, Dict, Tuple
 import numpy as np
-from text import TextProcessor, MAX_SEQ_LEN
+from text import TextProcessor, MAX_SEQ_LEN, SimpleTokenizer
 from model import ToyVLM, DEVICE, generate_response
 from shapes import ShapeGenerator, ObjType, ObjSize
+from questions import RationaleGenerator
+import os
 import random
 
 
-def build_examples(tp: TextProcessor) -> List[Dict]:
+def build_examples(tp: TextProcessor, num_examples: int = 8) -> List[Dict]:
     sg = ShapeGenerator()
-    # Prepare grayscale numpy arrays
     import numpy as np
-    img_c_np = np.zeros((64, 64), dtype=np.uint8)
-    sg._draw_single_shape(img_c_np, ObjType.CIRCLE, size=20, cx=32, cy=32)
-    img_s_np = np.zeros((64, 64), dtype=np.uint8)
-    sg._draw_single_shape(img_s_np, ObjType.SQUARE, size=20, cx=32, cy=32)
 
-    img_c = torch.tensor(img_c_np, dtype=torch.float32).unsqueeze(0) / 255.0
-    img_s = torch.tensor(img_s_np, dtype=torch.float32).unsqueeze(0) / 255.0
+    examples: List[Dict] = []
 
-    question = "is there a circle"
+    def random_center(size: int) -> tuple:
+        margin = size // 2 + 5
+        cx = random.randint(margin, 64 - margin)
+        cy = random.randint(margin, 64 - margin)
+        return cx, cy
 
-    examples = []
-    # yes (use exactly 16 image tokens for 4x4 pooling path)
-    inp_y, tgt_y, rat_y, ans_y = tp.prepare_input_sequence(question, answer="yes", rationale="count circle is 1", num_img_tokens=16, include_image=True)
-    inp_y = tp.pad_sequence(inp_y, MAX_SEQ_LEN)
-    tgt_y = tp.pad_sequence(tgt_y, MAX_SEQ_LEN)
-    rat_y = tp.pad_sequence(rat_y, MAX_SEQ_LEN)
-    ans_y = tp.pad_sequence(ans_y, MAX_SEQ_LEN)
-    examples.append({
-        'image': img_c,
-        'input_ids': torch.tensor(inp_y, dtype=torch.long),
-        'target_ids': torch.tensor(tgt_y, dtype=torch.long),
-        'rat_mask': torch.tensor(rat_y, dtype=torch.float32),
-        'ans_mask': torch.tensor(ans_y, dtype=torch.float32),
-        'expected_answer': 'yes',
-        'question': question,
-    })
+    for _ in range(num_examples):
+        shape = random.choice(list(ObjType))
+        not_shape = random.choice([e for e in ObjType if e != shape])
+        img_np = np.zeros((64, 64), dtype=np.uint8)
+        size = random.randint(12, 28)
+        cx, cy = random_center(size)
+        sg._draw_single_shape(img_np, shape, size=size, cx=cx, cy=cy)
+        img = torch.tensor(img_np, dtype=torch.float32).unsqueeze(0) / 255.0
+        inp, tgt, rat_m, ans_m = tp.prepare_input_sequence(
+            f"is there a {shape.value}", answer="yes", rationale=f"count {shape.value} is 1", num_img_tokens=16, include_image=True
+        )
+        inp = tp.pad_sequence(inp, MAX_SEQ_LEN)
+        tgt = tp.pad_sequence(tgt, MAX_SEQ_LEN)
+        rat_m = tp.pad_sequence(rat_m, MAX_SEQ_LEN)
+        ans_m = tp.pad_sequence(ans_m, MAX_SEQ_LEN)
+        examples.append({
+            'image': img,
+            'input_ids': torch.tensor(inp, dtype=torch.long),
+            'target_ids': torch.tensor(tgt, dtype=torch.long),
+            'rat_mask': torch.tensor(rat_m, dtype=torch.float32),
+            'ans_mask': torch.tensor(ans_m, dtype=torch.float32),
+            'expected_answer': 'yes',
+            'question': f"is there a {shape.value}",
+        })
 
-    # no (use exactly 16 image tokens for 4x4 pooling path)
-    inp_n, tgt_n, rat_n, ans_n = tp.prepare_input_sequence(question, answer="no", rationale="count circle is 0", num_img_tokens=16, include_image=True)
-    inp_n = tp.pad_sequence(inp_n, MAX_SEQ_LEN)
-    tgt_n = tp.pad_sequence(tgt_n, MAX_SEQ_LEN)
-    rat_n = tp.pad_sequence(rat_n, MAX_SEQ_LEN)
-    ans_n = tp.pad_sequence(ans_n, MAX_SEQ_LEN)
-    examples.append({
-        'image': img_s,
-        'input_ids': torch.tensor(inp_n, dtype=torch.long),
-        'target_ids': torch.tensor(tgt_n, dtype=torch.long),
-        'rat_mask': torch.tensor(rat_n, dtype=torch.float32),
-        'ans_mask': torch.tensor(ans_n, dtype=torch.float32),
-        'expected_answer': 'no',
-        'question': question,
-    })
+        inp, tgt, rat_m, ans_m = tp.prepare_input_sequence(
+            f"is there a {not_shape.value}", answer="no", rationale=f"count {not_shape.value} is 0", num_img_tokens=16, include_image=True
+        )
+        inp = tp.pad_sequence(inp, MAX_SEQ_LEN)
+        tgt = tp.pad_sequence(tgt, MAX_SEQ_LEN)
+        rat_m = tp.pad_sequence(rat_m, MAX_SEQ_LEN)
+        ans_m = tp.pad_sequence(ans_m, MAX_SEQ_LEN)
+        examples.append({
+            'image': img,
+            'input_ids': torch.tensor(inp, dtype=torch.long),
+            'target_ids': torch.tensor(tgt, dtype=torch.long),
+            'rat_mask': torch.tensor(rat_m, dtype=torch.float32),
+            'ans_mask': torch.tensor(ans_m, dtype=torch.float32),
+            'expected_answer': 'no',
+            'question': f"is there a {not_shape.value}",
+        })
 
     return examples
 
@@ -172,7 +181,7 @@ def print_vision_token_diagnostics(model: ToyVLM, exs: List[Dict]) -> None:
     model.eval()
     with torch.no_grad():
         img_c = exs[0]['image'].unsqueeze(0).to(DEVICE)
-        img_s = exs[1]['image'].unsqueeze(0).to(DEVICE)
+        img_s = exs[2]['image'].unsqueeze(0).to(DEVICE)
         toks_c = model.encode_image_tokens(img_c)  # [1,64,H]
         toks_s = model.encode_image_tokens(img_s)  # [1,64,H]
         H = toks_c.size(-1)
@@ -190,6 +199,71 @@ def print_vision_token_diagnostics(model: ToyVLM, exs: List[Dict]) -> None:
         l2 = torch.norm(v_c - v_s).item()
         print(f"Vision diagnostics: pooled mean L2={l2:.4f}, cosine={cos:.4f}")
 
+
+def build_dataset_examples(tp: TextProcessor, num_samples: int = 50, difficulty: str = 'easy', num_img_tokens: int = 64) -> List[Dict]:
+    sg = ShapeGenerator()
+    rg = RationaleGenerator()
+    examples: List[Dict] = []
+    for _ in range(num_samples):
+        num_shapes = random.randint(1, 4)
+        img_np, metadata = sg.generate_multi_shape_image(num_shapes, True)
+        q, a, r = rg.generate_qa_with_rationale(metadata, difficulty=difficulty)
+        inp, tgt, rat_m, ans_m = tp.prepare_input_sequence(q, a, r, num_img_tokens=num_img_tokens, include_image=True)
+        inp = tp.pad_sequence(inp, MAX_SEQ_LEN)
+        tgt = tp.pad_sequence(tgt, MAX_SEQ_LEN)
+        rat_m = tp.pad_sequence(rat_m, MAX_SEQ_LEN)
+        ans_m = tp.pad_sequence(ans_m, MAX_SEQ_LEN)
+        img_t = torch.tensor(img_np, dtype=torch.float32).unsqueeze(0) / 255.0
+        examples.append({
+            'image': img_t,
+            'input_ids': torch.tensor(inp, dtype=torch.long),
+            'target_ids': torch.tensor(tgt, dtype=torch.long),
+            'rat_mask': torch.tensor(rat_m, dtype=torch.float32),
+            'ans_mask': torch.tensor(ans_m, dtype=torch.float32),
+            'question': q,
+            'expected_answer': a,
+            'rationale': r,
+        })
+    return examples
+
+
+@torch.no_grad()
+def verify_teacher_forcing_dataset(model: ToyVLM, examples: List[Dict], dump_failures: int = 3, topk: int = 8) -> float:
+    model.eval()
+    tok = model.text_processor.tokenizer
+    correct = 0
+    failures_shown = 0
+    for ex in examples:
+        img = ex['image'].unsqueeze(0).to(DEVICE)
+        inp = ex['input_ids'].unsqueeze(0).to(DEVICE)
+        tgt = ex['target_ids'].unsqueeze(0).to(DEVICE)
+        logits = model(img, inp)
+        final_idx = (inp[0] == tok.final_start_id).nonzero(as_tuple=True)[0]
+        if final_idx.numel() == 0:
+            continue
+        k = int(final_idx[0].item())
+        next_logits = logits[0, k, :]
+        pred_id = int(next_logits.argmax().item())
+        pred = tok.decode([pred_id], skip_special_tokens=True)
+        exp = ex['expected_answer']
+        if pred.strip() == exp.strip():
+            correct += 1
+        elif failures_shown < dump_failures:
+            failures_shown += 1
+            # dump top-k around FINAL
+            scores, idxs = torch.topk(next_logits, k=topk)
+            pairs = []
+            for sc, ix in zip(scores.tolist(), idxs.tolist()):
+                s = tok.decode([ix], skip_special_tokens=False) or f"<{ix}>"
+                pairs.append(f"{s}:{sc:.2f}")
+            print("\n[TF-DIAG] Failure example:")
+            print(f"  Q: {ex['question']}")
+            print(f"  GT: {exp}")
+            print(f"  Pred@FINAL: {pred}")
+            print(f"  Top-{topk} @FINAL: {', '.join(pairs)}")
+    acc = correct / max(1, len(examples))
+    print(f"TF accuracy over {len(examples)} examples: {acc:.2%}")
+    return acc
 
 @torch.no_grad()
 def evaluate_auxiliary_heads(
@@ -303,18 +377,18 @@ def evaluate_auxiliary_heads(
 
 
 def main():
-    torch.manual_seed(0)
     tp = TextProcessor()
     # Ensure required words
-    for w in ["is", "there", "a", "circle", "square", "count", "0", "1", "yes", "no"]:
+    words = ["is", "there", "a", "count", "0", "1", "yes", "no"] + [e.value for e in ObjType]
+    for w in words:
         if w not in tp.tokenizer.vocab:
             tp.tokenizer.vocab[w] = len(tp.tokenizer.vocab)
     tp.tokenizer._update_mappings()
 
     model = ToyVLM(tp)
-    exs = build_examples(tp)
+    exs = build_examples(tp, num_examples=8)
 
-    print("Overfitting 2-sample task...")
+    print("Overfitting 8-sample task...")
     print_vision_token_diagnostics(model, exs)
     overfit(model, exs, iters=200, lr=3e-4)
 
