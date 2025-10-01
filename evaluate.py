@@ -11,7 +11,7 @@ from shapes import ShapeGenerator
 from questions import RationaleGenerator
 from text import TextProcessor, SimpleTokenizer
 from model import ToyVLM, generate_response, DEVICE
-
+import random
 
 class VLMEvaluator:
     """Evaluates VLM on generated test sets."""
@@ -22,13 +22,14 @@ class VLMEvaluator:
         self.shape_gen = ShapeGenerator()
         self.rationale_gen = RationaleGenerator()
 
-    def generate_test_set(self, num_samples: int, difficulty: str = 'easy') -> List[Dict]:
+    def generate_test_set(self, num_samples: int, difficulty: str) -> List[Dict]:
         """Generate a test set with ground truth."""
         test_samples = []
 
         for _ in range(num_samples):
             # Generate multi-shape image
-            image, metadata = self.shape_gen.generate_multi_shape_image()
+            num_shapes = random.randint(1, 4)
+            image, metadata = self.shape_gen.generate_multi_shape_image(num_shapes, False)
 
             # Generate question with ground truth rationale and answer
             question, answer, rationale = self.rationale_gen.generate_qa_with_rationale(
@@ -53,7 +54,7 @@ class VLMEvaluator:
         """Check if predicted answer matches ground truth (exact match)."""
         return self.normalize_answer(predicted) == self.normalize_answer(ground_truth)
 
-    def evaluate_test_set(self, test_samples: List[Dict], show_examples: int = 3) -> Tuple[Dict[str, float], List[Dict]]:
+    def evaluate_test_set(self, test_samples: List[Dict], show_examples: int) -> Tuple[Dict[str, float], List[Dict]]:
         """Evaluate model on test set and return metrics."""
         self.model.eval()
 
@@ -70,12 +71,13 @@ class VLMEvaluator:
             question = sample['question']
             gt_answer = sample['ground_truth_answer']
 
-            # Let generate_response handle image conversion and shaping
+            # Grayscale image: (H,W) -> (1,H,W)
+            img = torch.tensor(image, dtype=torch.float32).unsqueeze(0) / 255.0 # (1,H,W)
 
             # Generate prediction
             try:
                 pred_rationale, pred_answer = generate_response(
-                    self.model, image, question, max_length=35, return_rationale=True
+                    self.model, img, question, max_length=35, return_rationale=True
                 )
                 if not pred_answer.strip():
                     empty_predictions += 1
@@ -123,7 +125,7 @@ class VLMEvaluator:
 
         return metrics, results
 
-    def evaluate_by_difficulty(self, num_samples_per_difficulty: int = 100):
+    def evaluate_by_difficulty(self, num_samples_per_difficulty: int):
         """Evaluate on all difficulty levels."""
         difficulties = ['easy', 'medium', 'hard']
         all_metrics = {}
@@ -134,7 +136,7 @@ class VLMEvaluator:
             print('='*60)
 
             test_set = self.generate_test_set(num_samples_per_difficulty, difficulty)
-            metrics, results = self.evaluate_test_set(test_set, show_examples=2)
+            metrics, results = self.evaluate_test_set(test_set, show_examples=5)
 
             all_metrics[difficulty] = metrics
 
@@ -188,7 +190,7 @@ def main():
     evaluator = VLMEvaluator(model, text_processor)
 
     # Run evaluation
-    all_metrics = evaluator.evaluate_by_difficulty(num_samples_per_difficulty=100)
+    all_metrics = evaluator.evaluate_by_difficulty(num_samples_per_difficulty=10)
 
     return all_metrics
 

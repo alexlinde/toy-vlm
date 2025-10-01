@@ -10,6 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 from typing import Dict, List, Any
+import argparse
 from shapes import ShapeGenerator, ObjType
 from questions import RationaleGenerator
 from text import TextProcessor, MAX_SEQ_LEN
@@ -210,7 +211,6 @@ def collate_fn(batch):
         'image':         torch.stack([b['image'] for b in batch]),
         'input_tokens':  torch.stack([b['input_tokens'] for b in batch]),
         'target_tokens': torch.stack([b['target_tokens'] for b in batch]),
-        'loss_mask':     torch.stack([b['loss_mask'] for b in batch]),
         'rat_mask':      torch.stack([b['rat_mask'] for b in batch]),
         'ans_mask':      torch.stack([b['ans_mask'] for b in batch]),
         'aux_labels':    [b['aux_labels'] for b in batch],
@@ -253,7 +253,6 @@ def train_with_curriculum(model, datasets, num_epochs=NUM_EPOCHS):
             images = batch['image'].to(DEVICE)
             inp = batch['input_tokens'].to(DEVICE)
             tgt = batch['target_tokens'].to(DEVICE)
-            loss_mask = batch['loss_mask'].to(DEVICE)
             rat_mask  = batch['rat_mask'].to(DEVICE)
             ans_mask  = batch['ans_mask'].to(DEVICE)
             aux_labels = batch['aux_labels']
@@ -302,6 +301,11 @@ def train_with_curriculum(model, datasets, num_epochs=NUM_EPOCHS):
 
 def main():
     """Main training function with chain-of-thought reasoning."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=NUM_EPOCHS)
+    parser.add_argument("--samples_per_epoch", type=int, default=10000)
+    args = parser.parse_args()
+
     print("Initializing Toy VLM with Chain-of-Thought Reasoning...")
 
     # Build tokenizer vocabulary from rationales (NEW - uses RationaleGenerator)
@@ -319,10 +323,10 @@ def main():
 
     # Create curriculum datasets
     print("\nCreating curriculum datasets...")
-    datasets = create_curriculum_datasets(text_processor, samples_per_epoch=10000)
+    datasets = create_curriculum_datasets(text_processor, samples_per_epoch=args.samples_per_epoch)
 
     # Train model with curriculum
-    model = train_with_curriculum(model, datasets, num_epochs=NUM_EPOCHS)
+    model = train_with_curriculum(model, datasets, num_epochs=args.epochs)
 
     # Save model
     torch.save(model.state_dict(), 'toy_vlm_cot.pth')
