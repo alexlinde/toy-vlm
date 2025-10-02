@@ -87,7 +87,18 @@ Current hyperparameters:
 
 ## Installation
 
-Install dependencies using pip:
+### Recommended: use a project-local virtual environment (`.venv`)
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+- Always activate the venv before running any scripts: `source .venv/bin/activate`.
+- On Apple Silicon, PyTorch will run on `mps` automatically; on NVIDIA GPUs, install a CUDA-enabled PyTorch per the official guide if needed (see the PyTorch install selector under "Get Started").
+
+Alternative (not recommended): install globally
 ```bash
 pip install -r requirements.txt
 ```
@@ -96,6 +107,7 @@ pip install -r requirements.txt
 
 ### Training (with Curriculum Learning)
 ```bash
+source .venv/bin/activate
 python train_model.py
 ```
 - Trains for 10 epochs with curriculum learning (easy → medium → hard)
@@ -104,6 +116,7 @@ python train_model.py
 
 ### Evaluation
 ```bash
+source .venv/bin/activate
 python evaluate.py
 ```
 - Evaluates on 100 samples per difficulty level
@@ -112,9 +125,13 @@ python evaluate.py
 
 ### Interactive GUI
 ```bash
+source .venv/bin/activate
 python test_model.py
 ```
 Launches a Tkinter GUI for visual interaction with the trained model.
+
+### Device/runtime notes
+- Training auto-detects device via `runtime.py` (CUDA, MPS, or CPU) and configures AMP/autocast and dataloader settings accordingly. No extra flags are required for typical Mac (MPS) or NVIDIA GPU setups.
 
 #### GUI Features
 - **Question History**: Navigate previous questions using ↑/↓ arrow keys

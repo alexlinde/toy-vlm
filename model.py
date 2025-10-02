@@ -104,8 +104,7 @@ class VisionTokenEncoder(nn.Module):
         tokens = x.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
 
         # Project to hidden_dim and layer-norm
-        tokens = self.proj(tokens)                       # (B, N, hidden_dim)
-        tokens = self.drop(self.proj(tokens))
+        tokens = self.drop(self.proj(tokens)) # (B, N, hidden_dim))
         tokens = self.ln(tokens)
         
         # NaN/Inf guard

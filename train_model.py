@@ -14,7 +14,8 @@ import argparse
 from shapes import ShapeGenerator, ObjType
 from questions import RationaleGenerator
 from text import TextProcessor, MAX_SEQ_LEN, NUM_IMG_TOKENS
-from model import ToyVLM, DEVICE
+from model import ToyVLM
+from runtime import setup_runtime
 from utils_loss import compute_weighted_loss
 import random
 
@@ -116,9 +117,6 @@ def get_loss_weights(epoch: int) -> Dict[str, float]:
         return {'rationale': 0.5, 'answer': 4.0, 'aux': 0.2}
 
 
-## compute_weighted_loss is shared in utils_loss.compute_weighted_loss
-
-
 def create_curriculum_datasets(text_processor, samples_per_epoch=10000):
     """Create datasets for curriculum learning with increasing difficulty."""
     datasets = []
@@ -163,20 +161,31 @@ def collate_fn(batch):
         'rationale':     [b['rationale'] for b in batch],
     }
 
-def train_with_curriculum(model, datasets, num_epochs=NUM_EPOCHS):
+def train_with_curriculum(model, datasets, runtime, num_epochs=NUM_EPOCHS):
     """Train model with curriculum learning across different difficulty levels."""
-    model = model.to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+    device = runtime["device"]
+    model = runtime["to_device"](model)
+    model = runtime["maybe_compile"](model)
+
+    # Linear scaled LR based on effective batch size
+    scaled_lr = runtime["linear_scaled_lr"](base_lr=LEARNING_RATE, base_eff_batch=32, eff_batch=BATCH_SIZE)
+    optimizer = runtime["make_optimizer"](model, lr=scaled_lr, weight_decay=0.01)
     scheduler = StepLR(optimizer, step_size=3, gamma=0.5)
 
-    print(f"Training on {DEVICE}")
+    print(f"Training on {device}")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
     print("Using curriculum learning with difficulty progression")
 
     for epoch in range(num_epochs):
         # Get dataset for this epoch
         dataset = datasets[epoch]
-        train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, collate_fn=collate_fn)
+        train_loader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            collate_fn=collate_fn,
+            **{k: v for k, v in runtime["dataloader_kwargs"].items() if v is not None}
+        )
 
         model.train()
         total_loss = 0
@@ -193,25 +202,32 @@ def train_with_curriculum(model, datasets, num_epochs=NUM_EPOCHS):
         progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}')
 
         for batch in progress_bar:
-            images = batch['image'].to(DEVICE)
-            inp = batch['input_tokens'].to(DEVICE)
-            tgt = batch['target_tokens'].to(DEVICE)
-            rat_mask  = batch['rat_mask'].to(DEVICE)
-            ans_mask  = batch['ans_mask'].to(DEVICE)
+            images = batch['image'].to(device, non_blocking=True)
+            inp = batch['input_tokens'].to(device, non_blocking=True)
+            tgt = batch['target_tokens'].to(device, non_blocking=True)
+            rat_mask  = batch['rat_mask'].to(device, non_blocking=True)
+            ans_mask  = batch['ans_mask'].to(device, non_blocking=True)
             aux_labels = batch['aux_labels']
+            optimizer.zero_grad(set_to_none=True)
 
-            logits, aux_outputs = model(images, inp, return_aux=True)
+            with runtime["autocast"]:
+                logits, aux_outputs = model(images, inp, return_aux=True)
+                loss, rat_loss, ans_loss, aux_loss = compute_weighted_loss(
+                    logits, tgt, rat_mask, ans_mask,
+                    aux_outputs, aux_labels, model.text_processor.tokenizer, loss_weights
+                )
 
-            loss, rat_loss, ans_loss, aux_loss = compute_weighted_loss(
-                logits, tgt, rat_mask, ans_mask,
-                aux_outputs, aux_labels, model.text_processor.tokenizer, loss_weights
-            )
-
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if runtime["scaler"] is not None:
+                runtime["scaler"].scale(loss).backward()
+                # Unscale before clipping
+                runtime["scaler"].unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                runtime["scaler"].step(optimizer)
+                runtime["scaler"].update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
             total_loss += loss.item()
             total_rationale_loss += rat_loss.item()
@@ -247,6 +263,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=NUM_EPOCHS)
     parser.add_argument("--samples_per_epoch", type=int, default=10000)
+    parser.add_argument("--no_compile", action="store_true")
+    parser.add_argument("--try_fp8", action="store_true")
+    parser.add_argument("--target_eff_batch", type=int, default=None)
     args = parser.parse_args()
 
     print("Initializing Toy VLM with Chain-of-Thought Reasoning...")
@@ -264,12 +283,19 @@ def main():
     # Create model with the built tokenizer
     model = ToyVLM(text_processor)
 
+    # Setup runtime (device, amp, dataloader, optimizer factory)
+    runtime = setup_runtime(
+        prefer_compile=not args.no_compile,
+        try_fp8=args.try_fp8,
+        target_eff_batch=args.target_eff_batch,
+    )
+
     # Create curriculum datasets
     print("\nCreating curriculum datasets...")
     datasets = create_curriculum_datasets(text_processor, samples_per_epoch=args.samples_per_epoch)
 
     # Train model with curriculum
-    model = train_with_curriculum(model, datasets, num_epochs=args.epochs)
+    model = train_with_curriculum(model, datasets, runtime, num_epochs=args.epochs)
 
     # Save model
     torch.save(model.state_dict(), 'toy_vlm_cot.pth')
