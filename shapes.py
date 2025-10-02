@@ -150,6 +150,7 @@ class ShapeGenerator:
             # Draw the shape (grayscale - no color parameter)
             metadata = self._draw_single_shape(img, shape_type, size, cx, cy)
             metadata['size_category'] = size_category.value
+            metadata['cx'] = cx; metadata['cy'] = cy
             metadata_list.append(metadata)
 
             # Mark region as occupied

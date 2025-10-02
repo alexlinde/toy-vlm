@@ -8,16 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-from text import MAX_SEQ_LEN, NUM_IMG_TOKENS, TextProcessor
+from text import MAX_SEQ_LEN, NUM_IMG_TOKENS
 from shapes import ObjType, ObjSize
 
-# Model constants - device fallback
-if torch.backends.mps.is_available():
-    DEVICE = torch.device('mps')
-elif torch.cuda.is_available():
-    DEVICE = torch.device('cuda')
-else:
-    DEVICE = torch.device('cpu')
+# Model constants
 HIDDEN_DIM = 256
 NUM_HEADS = 4
 NUM_LAYERS = 6

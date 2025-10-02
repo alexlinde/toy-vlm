@@ -45,8 +45,21 @@ def setup_runtime(prefer_compile=True, try_fp8=False, target_eff_batch=None):
         amp_dtype = torch.float16
         autocast_ctx = torch.amp.autocast(device_type="mps", dtype=amp_dtype)
 
-    # Matmul precision (TF32 where applicable)
-    torch.set_float32_matmul_precision("high")
+    # TF32 / precision preferences using new API (CUDA only)
+    if device_type == "cuda":
+        try:
+            # cuDNN convolutions use TF32
+            if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "conv"):
+                torch.backends.cudnn.conv.fp32_precision = "tf32"
+        except Exception:
+            pass
+        try:
+            # cuBLAS matmul uses TF32-equivalent precision
+            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul") and \
+               hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+                torch.backends.cuda.matmul.fp32_precision = "high"  # or "ieee" to disable TF32
+        except Exception:
+            pass
 
     def to_device(model):
         model = model.to(device)

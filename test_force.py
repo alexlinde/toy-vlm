@@ -4,11 +4,19 @@ from typing import List, Dict, Tuple
 import numpy as np
 from text import TextProcessor, MAX_SEQ_LEN, NUM_IMG_TOKENS, SimpleTokenizer
 from utils_loss import compute_weighted_loss
-from model import ToyVLM, DEVICE, generate_response
+from model import ToyVLM, generate_response
 from shapes import ShapeGenerator, ObjType, ObjSize, SIZE_RANGES
 from questions import RationaleGenerator
 import os
 import random
+from runtime import setup_runtime
+
+
+# Initialize runtime (device, optional compile helpers)
+RUNTIME = setup_runtime()
+DEVICE = RUNTIME["device"]
+TO_DEVICE = RUNTIME["to_device"]
+MAYBE_COMPILE = RUNTIME["maybe_compile"]
 
 
 def build_examples(tp: TextProcessor, num_examples: int = 8) -> List[Dict]:
@@ -385,6 +393,8 @@ def main():
     tp.tokenizer._update_mappings()
 
     model = ToyVLM(tp)
+    model = TO_DEVICE(model)
+    model = MAYBE_COMPILE(model)
     exs = build_examples(tp, num_examples=8)
 
     print("Overfitting 8-sample task...")
