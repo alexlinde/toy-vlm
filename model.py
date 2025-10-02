@@ -22,41 +22,74 @@ HIDDEN_DIM = 256
 NUM_HEADS = 4
 NUM_LAYERS = 6
 
+# Squeeze-and-Excitation (SE) module
+class SE(nn.Module):
+    def __init__(self, c, r=8):
+        super().__init__()
+        self.fc1 = nn.Linear(c, max(1, c//r))
+        self.fc2 = nn.Linear(max(1, c//r), c)
+    def forward(self, x):  # x: (B,C,H,W)
+        b,c,h,w = x.shape
+        s = x.mean(dim=(2,3))                 # (B,C)
+        s = F.silu(self.fc1(s))
+        s = torch.sigmoid(self.fc2(s))        # (B,C)
+        return x * s.view(b,c,1,1)
+
 class VisionTokenEncoder(nn.Module):
-    """Tiny CNN -> 8x8 grid tokens -> linear to hidden_dim. Minimal for toy VLM."""
+    """Tiny CNN -> 8x8 grid tokens -> linear to hidden_dim, with ALWAYS-ON (x,y) coord channels."""
 
     def __init__(self, hidden_dim: int, channels: int = 64):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.channels = channels
 
-        # Input: (B, 1, 64, 64) - grayscale images
-        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
-        self.pool1 = nn.MaxPool2d(2)  # -> (B, 16, 32, 32)
+        # Input: (B, 1, 64, 64) - grayscale images; we'll concat (x,y) -> (B, 3, 64, 64)
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1)
+        self.pool1 = nn.AvgPool2d(2)  # -> (B, 16, 32, 32)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.pool2 = nn.MaxPool2d(2)  # -> (B, 32, 16, 16)
+        self.pool2 = nn.AvgPool2d(2)  # -> (B, 32, 16, 16)
         self.conv3 = nn.Conv2d(32, channels, kernel_size=3, padding=1, groups=4)
-        self.pool3 = nn.MaxPool2d(2)  # -> (B, C, 8, 8)
+        self.pool3 = nn.AvgPool2d(2)  # -> (B, C, 8, 8)
 
-        # Learnable 2D positional embeddings (folded into conv feature map)
+        # Learnable 2D positional embeddings aligned to the 8x8 conv feature map
         self.pos_embed_2d = nn.Parameter(torch.randn(1, channels, 8, 8) * 0.02)
+        self.pos_scale = nn.Parameter(torch.tensor(1.0))
 
         # Linear projection per-token to hidden_dim
         self.proj = nn.Linear(channels, hidden_dim)
+        self.drop = nn.Dropout(p=0.1)
+        self.ln = nn.LayerNorm(hidden_dim, eps=1e-5)
+
+        self.se3 = SE(channels)        
+
+    @staticmethod
+    def _coord_channels(B: int, H: int, W: int, device, dtype):
+        """
+        Returns (B, 2, H, W): x in [0,1] increasing left->right, y in [0,1] top->bottom.
+        """
+        y = torch.linspace(0.0, 1.0, steps=H, device=device, dtype=dtype).view(1, 1, H, 1).expand(B, 1, H, W)
+        x = torch.linspace(0.0, 1.0, steps=W, device=device, dtype=dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+        return torch.cat([x, y], dim=1)
 
     def forward(self, x):
         # x: (B, 1, 64, 64)
-        x = F.relu(self.conv1(x))
-        x = self.pool1(x)
-        x = F.relu(self.conv2(x))
-        x = self.pool2(x)
-        x = F.relu(self.conv3(x))
-        x = self.pool3(x)  # (B, C, 8, 8)
+        B, C, H, W = x.shape
+        assert C == 1, f"Expected grayscale input with 1 channel, got {C}"
+        assert H % 8 == 0 and W % 8 == 0, "Image size should be divisible by 8 for 8x8 grid downstream."
 
-        # Add 2D positional encoding
-        x = x + self.pos_embed_2d
+        # ALWAYS add (x,y) coordinate channels
+        coords = self._coord_channels(B, H, W, x.device, x.dtype)  # (B, 2, H, W)
+        x = torch.cat([x, coords], dim=1)  # (B, 3, H, W)
 
-        # Downsample 8x8 -> GxG where G^2 == NUM_IMG_TOKENS, then flatten to tokens
+        # Tiny CNN stem to 8x8 feature grid
+        x = F.silu(self.conv1(x)); x = self.pool1(x)
+        x = F.silu(self.conv2(x)); x = self.pool2(x)
+        x = F.silu(self.conv3(x)); x = self.se3(x); x = self.pool3(x)  # (B, C, 8, 8)
+
+        # Add 2D positional encoding at the 8x8 stage
+        x = x + self.pos_scale * self.pos_embed_2d
+
+        # Optional downsample to match NUM_IMG_TOKENS grid, then flatten to tokens
         B, C, H, W = x.shape  # expected 8x8
         if H * W != NUM_IMG_TOKENS:
             G = int(math.sqrt(NUM_IMG_TOKENS))
@@ -64,15 +97,18 @@ class VisionTokenEncoder(nn.Module):
             assert H % G == 0 and W % G == 0, f"Cannot pool from {H}x{W} to {G}x{G}"
             k_h = H // G
             k_w = W // G
-            x = F.avg_pool2d(x, kernel_size=(k_h, k_w), stride=(k_h, k_w))  # (B,C,G,G)
+            x = F.avg_pool2d(x, kernel_size=(k_h, k_w), stride=(k_h, k_w))  # (B, C, G, G)
             H, W = G, G
 
-        # Flatten to tokens (B, NUM_IMG_TOKENS, C)
+        # Flatten to tokens -> (B, NUM_IMG_TOKENS, C)
         tokens = x.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
 
-        # Project to hidden_dim -> (B, NUM_IMG_TOKENS, hidden_dim)
-        tokens = self.proj(tokens)
-        tokens = F.layer_norm(tokens, (self.hidden_dim,))
+        # Project to hidden_dim and layer-norm
+        tokens = self.proj(tokens)                       # (B, N, hidden_dim)
+        tokens = self.drop(self.proj(tokens))
+        tokens = self.ln(tokens)
+        
+        # NaN/Inf guard
         assert torch.isfinite(tokens).all(), "[model] NaN/Inf in vision tokens"
         return tokens
 
