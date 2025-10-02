@@ -13,7 +13,7 @@ import torch
 # Token/sequence constants
 # Increased to support prefixed image tokens
 MAX_SEQ_LEN = 128
-NUM_IMG_TOKENS = 16
+NUM_IMG_TOKENS = 64
 
 class SimpleTokenizer:
     """Simple word-based tokenizer for the toy VLM (word-level)."""
