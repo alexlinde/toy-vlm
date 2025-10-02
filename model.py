@@ -307,21 +307,23 @@ class ToyVLM(nn.Module):
 
         # 3) Replace <IMG> placeholder embeddings with visual tokens in order
         tok = self.text_processor.tokenizer
+        # Prepare per-token type embeddings: default to text_type, override image positions with vision_type
+        type_add = self.text_type.expand(batch_size, seq_len, -1).clone()
         for b in range(batch_size):
             img_positions = (input_tokens[b] == tok.img_token_id).nonzero(as_tuple=True)[0]
             n = img_positions.numel()
             assert n == NUM_IMG_TOKENS, f"expected {NUM_IMG_TOKENS} image tokens, got {n}"
             btok = img_tokens[b:b+1]  # [1, NUM_IMG_TOKENS, H]
             token_embeds[b, img_positions, :] = btok[0]
-            # Add vision type embedding to image token positions
-            token_embeds[b, img_positions, :] = token_embeds[b, img_positions, :] + self.vision_type
+            # Set type embedding for image tokens to vision_type (do not also add text_type)
+            type_add[b, img_positions, :] = self.vision_type
 
         # Basic structure checks
         assert torch.isfinite(token_embeds).all(), "[model] NaN/Inf in token_embeds"
 
         # 4) Add positional and type embeddings
         positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        input_embeds = token_embeds + self.position_embedding(positions) + self.text_type
+        input_embeds = token_embeds + self.position_embedding(positions) + type_add
         input_embeds = self.input_norm(input_embeds)
         input_embeds = self.dropout(input_embeds)
 
