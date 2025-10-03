@@ -122,74 +122,88 @@ class MultiHeadAttention(nn.Module):
         self.W_o = nn.Linear(d_model, d_model)
         
     def forward(self, query, key, value, mask=None):
-        batch_size = query.size(0)
-        
-        # Linear transformations and reshape
-        Q = self.W_q(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        K = self.W_k(key).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        V = self.W_v(value).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        
-        # Attention
+        B = query.size(0)
+        Q = self.W_q(query).view(B, -1, self.num_heads, self.d_k).transpose(1, 2)
+        K = self.W_k(key).view(B, -1, self.num_heads, self.d_k).transpose(1, 2)
+        V = self.W_v(value).view(B, -1, self.num_heads, self.d_k).transpose(1, 2)
+
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        
         if mask is not None:
+            # mask: (T,T) -> (B,h,T,T)
+            mask = mask.to(torch.bool)[None, None, :, :].expand(B, self.num_heads, -1, -1)
             scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-        
-        attention = F.softmax(scores, dim=-1)
-        context = torch.matmul(attention, V)
-        
-        # Concatenate heads
-        context = context.transpose(1, 2).contiguous().view(
-            batch_size, -1, self.d_model
-        )
-        
-        output = self.W_o(context)
-        return output
+
+        attn = F.softmax(scores, dim=-1)
+        context = torch.matmul(attn, V)
+        context = context.transpose(1, 2).contiguous().view(B, -1, self.d_model)
+        return self.W_o(context)
+
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, num_heads):
+    def __init__(self, d_model, num_heads, attn_dropout=0.0, resid_dropout=0.1, layerscale_init=1e-2):
         super().__init__()
-        self.self_attention = MultiHeadAttention(d_model, num_heads)
         self.norm1 = nn.LayerNorm(d_model)
+        self.attn  = MultiHeadAttention(d_model, num_heads)
+        self.attn_drop = nn.Dropout(attn_dropout)
+
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(d_model * 4, d_model),
-            nn.Dropout(0.1)
         )
+        self.resid_drop = nn.Dropout(resid_dropout)
+
+        # LayerScale (per-dim learnable residual scales)
+        self.ls1 = nn.Parameter(torch.ones(d_model) * layerscale_init)
+        self.ls2 = nn.Parameter(torch.ones(d_model) * layerscale_init)
 
     def forward(self, x, mask=None):
-        attn_output = self.self_attention(x, x, x, mask)
-        x = self.norm1(x + attn_output)
-        ffn_output = self.ffn(x)
-        x = self.norm2(x + ffn_output)
+        a = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), mask)
+        a = self.attn_drop(a)
+        x = x + self.ls1 * a
+
+        f = self.ffn(self.norm2(x))
+        f = self.resid_drop(f)
+        x = x + self.ls2 * f
         return x
 
+
+class TokenPool(nn.Module):
+    """Single-query attention pooling over tokens."""
+    def __init__(self, d_model: int):
+        super().__init__()
+        # Learned query (1,1,D); initialized small
+        self.q = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, N, D] tokens
+        returns: [B, D] pooled
+        """
+        B, N, D = x.shape
+        q = self.q.expand(B, -1, -1)                     # [B,1,D]
+        attn_logits = torch.matmul(q, x.transpose(1, 2)) # [B,1,N]
+        attn = torch.softmax(attn_logits / math.sqrt(D), dim=-1)  # [B,1,N]
+        pooled = torch.matmul(attn, x).squeeze(1)        # [B,D]
+        return pooled
+
 class AuxiliaryHeads(nn.Module):
-    """Auxiliary heads for global object and size counts.
-
-    These operate on a pooled representation of the visual tokens. We keep them
-    lightweight: a small MLP that predicts capped counts (0..4) for each shape
-    type and for each size category.
-    """
-
     def __init__(self, hidden_dim: int, max_count: int = 5):
         super().__init__()
-        # Predict counts in {0,1,2,3,4} -> num_classes = 5
         self.num_classes = max_count
-        # Number of shapes and sizes
         self.num_shapes = len(ObjType)
         self.num_sizes = len(ObjSize)
 
-        # Shared pooling MLP over token dimension
+        # NEW: attention pooling
+        self.token_pool = TokenPool(hidden_dim)
+
         self.pool_norm = nn.LayerNorm(hidden_dim)
         self.pool_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
 
-        # Per-task linear heads
         self.shape_count_heads = nn.ModuleList([
             nn.Linear(hidden_dim, self.num_classes) for _ in range(self.num_shapes)
         ])
@@ -198,37 +212,21 @@ class AuxiliaryHeads(nn.Module):
         ])
 
     def forward(self, vision_tokens: torch.Tensor):
-        """Compute auxiliary predictions.
-
-        Args:
-            vision_tokens: Tensor [B, N, H] pooled image tokens used as visual prefix
-        Returns:
-            dict with keys:
-              - 'count_logits': {shape_name: Tensor[B, 5]}
-              - 'size_count_logits': {size_name: Tensor[B, 5]}
-        """
-        assert vision_tokens is not None, "vision_tokens must be provided to aux heads"
-        # Mean pool across tokens -> [B, H]
-        pooled = vision_tokens.mean(dim=1)
+        # vision_tokens: [B, N, H]
+        pooled = self.token_pool(vision_tokens)  # <-- was mean(dim=1)
         pooled = self.pool_norm(pooled)
         pooled = self.pool_proj(pooled)
 
-        # Shape counts
         count_logits = {}
         for idx, obj in enumerate(ObjType):
-            head = self.shape_count_heads[idx]
-            count_logits[obj.value] = head(pooled)
+            count_logits[obj.value] = self.shape_count_heads[idx](pooled)
 
-        # Size counts
         size_count_logits = {}
         for idx, size in enumerate(ObjSize):
-            head = self.size_count_heads[idx]
-            size_count_logits[size.value] = head(pooled)
+            size_count_logits[size.value] = self.size_count_heads[idx](pooled)
 
-        return {
-            'count_logits': count_logits,
-            'size_count_logits': size_count_logits,
-        }
+        return {'count_logits': count_logits, 'size_count_logits': size_count_logits}
+
 
 
 class ToyVLM(nn.Module):
@@ -278,10 +276,10 @@ class ToyVLM(nn.Module):
             nn.init.zeros_(self.output_projection.bias)  # common practice
 
     def create_causal_mask(self, seq_len, device):
-        """Create causal mask for autoregressive generation."""
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
-        return mask == 0
-    
+        base = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+        # allowed = lower-tri including diag
+        return ~base  # True = keep, False = mask
+
     def encode_image_tokens(self, images):
         """Encode image into exactly NUM_IMG_TOKENS visual tokens [B, N, H]."""
         return self.vision_token_encoder(images)

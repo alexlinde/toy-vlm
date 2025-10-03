@@ -9,6 +9,7 @@ import json
 import os
 from typing import List, Set
 import torch
+from shapes import ObjType
 
 # Token/sequence constants
 # Increased to support prefixed image tokens
@@ -97,16 +98,12 @@ class SimpleTokenizer:
                 except Exception as e:
                     print(f"Warning: Could not generate QA with rationale: {e}")
                     continue
-        print(word_set)
-        # Add common words that might be missing
-        common_words = {
-            'shape', 'shapes', 'big', 'small', 'object', 'figure', 'size',
-            'at', 'and', 'or', 'the', 'a', 'is', 'are', 'there', 'they',
-            'count', 'found', 'compare', 'vs', 'greater', 'less', 'equal',
-            'look', 'identify', 'zero', 'one', 'two', 'three', 'four',
-            '0', '1', '2', '3', '4', 'yes', 'no'
-        }
-        word_set.update(common_words)
+        # add shapes and digits 0-9
+        word_set.update({e.value for e in list(ObjType)})
+        word_set.update({str(i) for i in range(10)})
+        
+        # add common words that might be missing
+        word_set.update({'yes', 'no', 'is', 'are', 'there', 'count', 'compare', 'equal', 'greater', 'less'})
 
         # Build vocabulary
         next_idx = len(self.vocab)

@@ -113,6 +113,14 @@ def setup_runtime(prefer_compile=True, try_fp8=False, target_eff_batch=None):
         )
         return opt
 
+    def make_optimizer_from_groups(param_groups, lr, device_type="cuda"):
+        return torch.optim.AdamW(
+            param_groups,
+            lr=lr, betas=(0.9, 0.95), eps=1e-8,
+            weight_decay=0.0,   # groups already specify WD
+            fused=True if device_type == "cuda" else False
+        )
+
     def linear_scaled_lr(base_lr, base_eff_batch=256, eff_batch=None):
         eff = eff_batch or target_eff_batch or base_eff_batch
         return base_lr * (eff / base_eff_batch)
@@ -121,7 +129,7 @@ def setup_runtime(prefer_compile=True, try_fp8=False, target_eff_batch=None):
         "device": device, "device_type": device_type,
         "autocast": autocast_ctx, "amp_dtype": amp_dtype, "scaler": scaler,
         "to_device": to_device, "maybe_compile": maybe_compile,
-        "dataloader_kwargs": dl_kwargs,
+        "dataloader_kwargs": dl_kwargs, "make_optimizer_from_groups": make_optimizer_from_groups,
         "make_optimizer": make_optimizer, "linear_scaled_lr": linear_scaled_lr,
     }
 

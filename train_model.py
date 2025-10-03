@@ -7,17 +7,17 @@ Now with chain-of-thought reasoning capabilities.
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 from typing import Dict, List, Any
 import argparse
 from shapes import ShapeGenerator, ObjType
 from questions import RationaleGenerator
-from text import TextProcessor, MAX_SEQ_LEN, NUM_IMG_TOKENS
+from text import TextProcessor, MAX_SEQ_LEN
 from model import ToyVLM
 from runtime import setup_runtime
 from utils_loss import compute_weighted_loss
 import random
+import math
 
 # Training constants
 BATCH_SIZE = 32
@@ -39,7 +39,7 @@ class ShapeDataset(Dataset):
 
     def __getitem__(self, idx):
         # Generate multi-shape RGB image with metadata
-        num_shapes = random.randint(1, 4)
+        num_shapes = random.randint(1, 8)
         image, metadata_list = self.shape_generator.generate_multi_shape_image(num_shapes, True)
 
         # Generate Q&A pair with rationale based on metadata
@@ -112,9 +112,9 @@ def get_loss_weights(epoch: int) -> Dict[str, float]:
     if epoch < 3:  # Epochs 0-2: Learn basic structure
         return {'rationale': 1.0, 'answer': 2.0, 'aux': 0.5}
     elif epoch < 6:  # Epochs 3-5: Balance with emphasis on answers
-        return {'rationale': 0.8, 'answer': 3.0, 'aux': 0.3}
+        return {'rationale': 0.7, 'answer': 3.5, 'aux': 0.3}
     else:  # Epochs 6+: Strong focus on correct answers
-        return {'rationale': 0.5, 'answer': 4.0, 'aux': 0.2}
+        return {'rationale': 0.4, 'answer': 4.5, 'aux': 0.2}
 
 
 def create_curriculum_datasets(text_processor, samples_per_epoch=10000):
@@ -161,23 +161,55 @@ def collate_fn(batch):
         'rationale':     [b['rationale'] for b in batch],
     }
 
+def build_param_groups(model, wd=0.01):
+    no_wd = {
+        id(model.token_embedding.weight),
+        id(model.position_embedding.weight),
+        id(model.text_type), id(model.vision_type),
+        id(model.vision_token_encoder.pos_embed_2d),
+        id(model.vision_token_encoder.pos_scale),
+    }
+    decay, nodecay = [], []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        (nodecay if id(p) in no_wd or p.ndim == 1 else decay).append(p)
+    return [
+        {'params': decay,   'weight_decay': wd},
+        {'params': nodecay, 'weight_decay': 0.0},
+    ]
+
+def cosine_warmup_scheduler(optimizer, warmup_steps, total_steps):
+    def fn(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, fn)
+
+def total_steps_for(datasets, batch_size):
+    import math
+    return sum(math.ceil(len(ds) / batch_size) for ds in datasets)
+
 def train_with_curriculum(model, datasets, runtime, num_epochs=NUM_EPOCHS):
-    """Train model with curriculum learning across different difficulty levels."""
     device = runtime["device"]
     model = runtime["to_device"](model)
     model = runtime["maybe_compile"](model)
 
-    # Linear scaled LR based on effective batch size
     scaled_lr = runtime["linear_scaled_lr"](base_lr=LEARNING_RATE, base_eff_batch=32, eff_batch=BATCH_SIZE)
-    optimizer = runtime["make_optimizer"](model, lr=scaled_lr, weight_decay=0.01)
-    scheduler = StepLR(optimizer, step_size=3, gamma=0.5)
+    param_groups = build_param_groups(model, wd=0.01)
+    optimizer = runtime["make_optimizer_from_groups"](param_groups, lr=scaled_lr)
+
+    # Scheduler setup (no need for 'dataset' here)
+    total_steps = total_steps_for(datasets, BATCH_SIZE)
+    warmup_steps = int(0.05 * total_steps)
+    scheduler = cosine_warmup_scheduler(optimizer, warmup_steps, total_steps)
 
     print(f"Training on {device}")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
     print("Using curriculum learning with difficulty progression")
 
     for epoch in range(num_epochs):
-        # Get dataset for this epoch
         dataset = datasets[epoch]
         train_loader = DataLoader(
             dataset,
@@ -188,16 +220,10 @@ def train_with_curriculum(model, datasets, runtime, num_epochs=NUM_EPOCHS):
         )
 
         model.train()
-        total_loss = 0
-        total_rationale_loss = 0
-        total_answer_loss = 0
-        total_aux_loss = 0
+        total_loss = total_rationale_loss = total_answer_loss = total_aux_loss = 0.0
 
-        # Get loss weights for this epoch
         loss_weights = get_loss_weights(epoch)
-
-        difficulty = dataset.difficulty
-        print(f"\nEpoch {epoch+1}/{num_epochs} - Difficulty: {difficulty}")
+        print(f"\nEpoch {epoch+1}/{num_epochs} - Difficulty: {dataset.difficulty}")
         print(f"Loss weights: {loss_weights}")
         progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}')
 
@@ -205,11 +231,11 @@ def train_with_curriculum(model, datasets, runtime, num_epochs=NUM_EPOCHS):
             images = batch['image'].to(device, non_blocking=True)
             inp = batch['input_tokens'].to(device, non_blocking=True)
             tgt = batch['target_tokens'].to(device, non_blocking=True)
-            rat_mask  = batch['rat_mask'].to(device, non_blocking=True)
-            ans_mask  = batch['ans_mask'].to(device, non_blocking=True)
+            rat_mask = batch['rat_mask'].to(device, non_blocking=True)
+            ans_mask = batch['ans_mask'].to(device, non_blocking=True)
             aux_labels = batch['aux_labels']
-            optimizer.zero_grad(set_to_none=True)
 
+            optimizer.zero_grad(set_to_none=True)
             with runtime["autocast"]:
                 logits, aux_outputs = model(images, inp, return_aux=True)
                 loss, rat_loss, ans_loss, aux_loss = compute_weighted_loss(
@@ -219,7 +245,6 @@ def train_with_curriculum(model, datasets, runtime, num_epochs=NUM_EPOCHS):
 
             if runtime["scaler"] is not None:
                 runtime["scaler"].scale(loss).backward()
-                # Unscale before clipping
                 runtime["scaler"].unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 runtime["scaler"].step(optimizer)
@@ -228,6 +253,8 @@ def train_with_curriculum(model, datasets, runtime, num_epochs=NUM_EPOCHS):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+
+            scheduler.step()  # step per batch
 
             total_loss += loss.item()
             total_rationale_loss += rat_loss.item()
@@ -251,12 +278,9 @@ def train_with_curriculum(model, datasets, runtime, num_epochs=NUM_EPOCHS):
         print(f"  Rationale Loss: {avg_rat_loss:.4f}")
         print(f"  Answer Loss: {avg_ans_loss:.4f}")
         print(f"  Aux Loss: {avg_aux_loss:.4f}")
-        print(f"  Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
-
-        scheduler.step()
+        print(f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
 
     return model
-
 
 def main():
     """Main training function with chain-of-thought reasoning."""

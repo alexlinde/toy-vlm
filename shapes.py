@@ -7,7 +7,7 @@ import numpy as np
 import random
 from enum import Enum
 from typing import List, Tuple, Dict, Any
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # Image constants
 IMAGE_SIZE = 64
@@ -16,7 +16,7 @@ class ObjType(Enum):
     """Object type enumeration for shape classification."""
     SQUARE = "square"
     CIRCLE = "circle"
-    RECTANGLE = "rectangle"
+    # RECTANGLE = "rectangle"
     CROSS = "cross"
     TRIANGLE = "triangle"
 
@@ -35,70 +35,63 @@ SIZE_RANGES = {
 class ShapeGenerator:
     """Generates simple geometric shapes as grayscale images."""
 
-    def _draw_single_shape(self, img: np.ndarray, shape_type: ObjType, size: int, cx: int, cy: int) -> Dict[str, Any]:
+    def _draw_single_shape(self, img: np.ndarray, shape_type: ObjType, size: int, cx: int, cy: int, rotation: float = 0.0) -> Dict[str, Any]:
         """Draw a single shape on the grayscale image and return its metadata."""
-        # Create a temporary single-channel mask
-        mask = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=bool)
+        # Create a temporary single-channel mask image for the shape
+        shape_mask = Image.new('L', (IMAGE_SIZE, IMAGE_SIZE), 0)
+        draw = ImageDraw.Draw(shape_mask)
 
         if shape_type == ObjType.SQUARE:
-            x1, y1 = cx - size//2, cy - size//2
-            x2, y2 = x1 + size, y1 + size
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(IMAGE_SIZE, x2), min(IMAGE_SIZE, y2)
-            mask[y1:y2, x1:x2] = True
+            half = size // 2
+            x1, y1 = cx - half, cy - half
+            x2, y2 = cx + half, cy + half
+            draw.rectangle([x1, y1, x2, y2], fill=255)
 
         elif shape_type == ObjType.CIRCLE:
             radius = size // 2
-            yy, xx = np.ogrid[:IMAGE_SIZE, :IMAGE_SIZE]
-            circle_mask = (xx - cx)**2 + (yy - cy)**2 <= radius**2
-            mask = circle_mask
+            x1, y1 = cx - radius, cy - radius
+            x2, y2 = cx + radius, cy + radius
+            draw.ellipse([x1, y1, x2, y2], fill=255)
 
-        elif shape_type == ObjType.RECTANGLE:
+        elif hasattr(ObjType, 'RECTANGLE') and shape_type == ObjType.RECTANGLE:
             width = int(size * random.uniform(0.6, 1.4))
             height = int(size * random.uniform(0.6, 1.4))
-            x1, y1 = cx - width//2, cy - height//2
-            x2, y2 = x1 + width, y1 + height
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(IMAGE_SIZE, x2), min(IMAGE_SIZE, y2)
-            mask[y1:y2, x1:x2] = True
+            x1, y1 = cx - width // 2, cy - height // 2
+            x2, y2 = cx + width // 2, cy + height // 2
+            draw.rectangle([x1, y1, x2, y2], fill=255)
 
         elif shape_type == ObjType.CROSS:
             thickness = max(2, size // 8)
             length = size // 2
-            # Horizontal line
-            y1, y2 = max(0, cy - thickness), min(IMAGE_SIZE, cy + thickness)
-            x1, x2 = max(0, cx - length), min(IMAGE_SIZE, cx + length)
-            mask[y1:y2, x1:x2] = True
-            # Vertical line
-            y1, y2 = max(0, cy - length), min(IMAGE_SIZE, cy + length)
-            x1, x2 = max(0, cx - thickness), min(IMAGE_SIZE, cx + thickness)
-            mask[y1:y2, x1:x2] = True
+            # Horizontal bar
+            hx1, hy1 = cx - length, cy - thickness
+            hx2, hy2 = cx + length, cy + thickness
+            draw.rectangle([hx1, hy1, hx2, hy2], fill=255)
+            # Vertical bar
+            vx1, vy1 = cx - thickness, cy - length
+            vx2, vy2 = cx + thickness, cy + length
+            draw.rectangle([vx1, vy1, vx2, vy2], fill=255)
 
         elif shape_type == ObjType.TRIANGLE:
-            # Define three vertices of the triangle
-            x1, y1 = cx, cy - size//2  # Top vertex
-            x2, y2 = cx - size//2, cy + size//2  # Bottom left
-            x3, y3 = cx + size//2, cy + size//2  # Bottom right
+            half = size // 2
+            x1, y1 = cx, cy - half  # top
+            x2, y2 = cx - half, cy + half  # bottom-left
+            x3, y3 = cx + half, cy + half  # bottom-right
+            draw.polygon([(x1, y1), (x2, y2), (x3, y3)], fill=255)
 
-            # Fill triangle using barycentric coordinates
-            for yp in range(max(0, cy - size//2), min(IMAGE_SIZE, cy + size//2 + 1)):
-                for xp in range(max(0, cx - size//2), min(IMAGE_SIZE, cx + size//2 + 1)):
-                    denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
-                    if abs(denom) > 1e-10:
-                        a = ((y2 - y3) * (xp - x3) + (x3 - x2) * (yp - y3)) / denom
-                        b = ((y3 - y1) * (xp - x3) + (x1 - x3) * (yp - y3)) / denom
-                        c = 1 - a - b
-                        if a >= 0 and b >= 0 and c >= 0:
-                            mask[yp, xp] = True
+        # Rotate the mask around the shape center and composite onto the image
+        if rotation:
+            shape_mask = shape_mask.rotate(rotation, resample=Image.NEAREST, expand=False, center=(cx, cy))
 
-        # Set white (255) for shape pixels in grayscale
-        img[mask] = 255
+        mask_np = np.array(shape_mask, dtype=np.uint8)
+        img[mask_np > 0] = 255
 
         metadata = {
             'shape': shape_type.value,
             'size': size,
-            'center_x': cx,
-            'center_y': cy
+            'cx': cx,
+            'cy': cy,
+            'rotation': float(rotation)
         }
 
         return metadata
@@ -150,7 +143,6 @@ class ShapeGenerator:
             # Draw the shape (grayscale - no color parameter)
             metadata = self._draw_single_shape(img, shape_type, size, cx, cy)
             metadata['size_category'] = size_category.value
-            metadata['cx'] = cx; metadata['cy'] = cy
             metadata_list.append(metadata)
 
             # Mark region as occupied
