@@ -41,8 +41,14 @@ class ShapeGenerator:
             img[mask] = 1.0
             
         elif shape_type == 'rectangle':
-            width = random.randint(15, max_size)
-            height = random.randint(15, max_size)
+            min_side = 15
+            # Ensure rectangle is meaningfully non-square
+            while True:
+                width = random.randint(min_side, max_size)
+                height = random.randint(min_side, max_size)
+                ratio = max(width, height) / max(1, min(width, height))
+                if ratio >= 1.3:
+                    break
             x = random.randint(margin, IMAGE_SIZE - margin - width)
             y = random.randint(margin, IMAGE_SIZE - margin - height)
             img[y:y+height, x:x+width] = 1.0
@@ -60,7 +66,7 @@ class ShapeGenerator:
             
         elif shape_type == 'triangle':
             # Generate proper triangle with three vertices
-            size = random.randint(20, max_size)
+            size = random.randint(24, max_size)
             cx = random.randint(margin + size//2, IMAGE_SIZE - margin - size//2)
             cy = random.randint(margin + size//2, IMAGE_SIZE - margin - size//2)
             

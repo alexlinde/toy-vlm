@@ -54,11 +54,10 @@ class QuestionGenerator:
         template = self.env.get_template(template_name)
         
         # Render the template with shape context
+        other_shapes = [s for s in self.shapes if s != shape_type]
         context = {
             'shape': shape_type,
-            'shapes': self.shapes,
-            'other_shapes': [s for s in self.shapes if s != shape_type],
-            'random_other_shape': random.choice([s for s in self.shapes if s != shape_type])
+            'random_other_shape': random.choice(other_shapes)
         }
         
         result = template.render(**context)

@@ -18,7 +18,7 @@ elif torch.cuda.is_available():
 else:
     DEVICE = torch.device('cpu')
 HIDDEN_DIM = 256
-NUM_HEADS = 4
+NUM_HEADS = 8
 NUM_LAYERS = 4
 
 class SimpleVisionEncoder(nn.Module):
@@ -32,25 +32,15 @@ class SimpleVisionEncoder(nn.Module):
         self.pool2 = nn.MaxPool2d(2)
         self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.pool3 = nn.MaxPool2d(2)
-        
-        # Calculate flattened size: 64x64 -> 32x32 -> 16x16 -> 8x8
-        self.flatten_size = 64 * 8 * 8
-        self.fc1 = nn.Linear(self.flatten_size, 512)
-        self.fc2 = nn.Linear(512, output_dim)
-        self.dropout = nn.Dropout(0.1)
+        self.proj = nn.Conv2d(64, output_dim, kernel_size=1)
         
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = self.pool1(x)
-        x = F.relu(self.conv2(x))
-        x = self.pool2(x)
-        x = F.relu(self.conv3(x))
-        x = self.pool3(x)
+        x = F.relu(self.conv1(x)); x = self.pool1(x)
+        x = F.relu(self.conv2(x)); x = self.pool2(x)
+        x = F.relu(self.conv3(x)); x = self.pool3(x) # [B, 64, 8, 8]
         
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
+        x = self.proj(x) # [B, H, 8, 8]
+        x = x.flatten(2).transpose(1, 2) # [B, 64, H]
         return x
 
 class MultiHeadAttention(nn.Module):
@@ -167,12 +157,10 @@ class TransformerBlock(nn.Module):
 class ToyVLM(nn.Module):
     """Simple Vision-Language Model."""
     
-    def __init__(self, text_processor=None, hidden_dim=HIDDEN_DIM, num_heads=NUM_HEADS, num_layers=NUM_LAYERS):
+    def __init__(self, text_processor, hidden_dim=HIDDEN_DIM, num_heads=NUM_HEADS, num_layers=NUM_LAYERS):
         super().__init__()
         
-        # Initialize text processor if not provided
-        if text_processor is None:
-            text_processor = TextProcessor()
+        # Text processor
         self.text_processor = text_processor
         vocab_size = text_processor.tokenizer.get_vocab_size()
         
@@ -183,6 +171,13 @@ class ToyVLM(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.position_embedding = nn.Embedding(MAX_SEQ_LEN, hidden_dim)
         
+        # Vision token enhancements: positional embeddings, CLS token, and normalization
+        self.vision_pos_embedding = nn.Parameter(torch.zeros(64, hidden_dim))
+        nn.init.normal_(self.vision_pos_embedding, std=0.02)
+        self.vis_cls = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        nn.init.normal_(self.vis_cls, std=0.02)
+        self.vision_norm = nn.LayerNorm(hidden_dim)
+
         # Vision-language fusion
         self.vision_projection = nn.Linear(hidden_dim, hidden_dim)
         
@@ -204,10 +199,15 @@ class ToyVLM(nn.Module):
         batch_size, seq_len = input_tokens.shape
         device = input_tokens.device
 
-        # Encode vision features as memory
-        vision_features = self.vision_encoder(images)  # [batch, hidden_dim]
-        vision_memory = self.vision_projection(vision_features)
-        vision_memory = vision_memory.unsqueeze(1)  # [batch, 1, hidden_dim]
+        # Encode vision features as memory tokens
+        vision_features = self.vision_encoder(images)  # [batch, 64, hidden_dim]
+        vision_memory = self.vision_projection(vision_features)  # [batch, 64, hidden_dim]
+        # Add learned 2D positions, normalize, and prepend a visual CLS token
+        B, M, H = vision_memory.shape
+        pos = self.vision_pos_embedding[:M].unsqueeze(0).expand(B, -1, -1)
+        vision_memory = self.vision_norm(vision_memory + pos)
+        vis_cls = self.vis_cls.expand(B, 1, H)
+        vision_memory = torch.cat([vis_cls, vision_memory], dim=1)  # [batch, M+1, hidden_dim]
 
         # Embed text tokens
         token_embeds = self.token_embedding(input_tokens)  # [batch, seq_len, hidden_dim]
