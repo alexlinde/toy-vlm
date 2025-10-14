@@ -8,7 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-from text import MAX_SEQ_LEN, TextProcessor
+from text import MAX_SEQ_LEN
+from shapes import IMAGE_SIZE
 
 # Model constants - device fallback
 if torch.backends.mps.is_available():
@@ -21,27 +22,28 @@ HIDDEN_DIM = 256
 NUM_HEADS = 8
 NUM_LAYERS = 4
 
-class SimpleVisionEncoder(nn.Module):
-    """Simple CNN for encoding images."""
-    
-    def __init__(self, output_dim=HIDDEN_DIM):
+import torch
+import torch.nn as nn
+
+class SimpleViTEncoder(nn.Module):
+    def __init__(self, d_model=HIDDEN_DIM, patch_size=8, image_size=IMAGE_SIZE):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
-        self.pool1 = nn.MaxPool2d(2)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.pool2 = nn.MaxPool2d(2)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.pool3 = nn.MaxPool2d(2)
-        self.proj = nn.Conv2d(64, output_dim, kernel_size=1)
-        
+        self.patch_embed = nn.Conv2d(
+            1, d_model, kernel_size=patch_size, stride=patch_size
+        )  # (B, d_model, 8, 8)
+
+        num_patches = (image_size // patch_size) ** 2  # 64
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, d_model))
+        self.norm = nn.LayerNorm(d_model)
+
     def forward(self, x):
-        x = F.relu(self.conv1(x)); x = self.pool1(x)
-        x = F.relu(self.conv2(x)); x = self.pool2(x)
-        x = F.relu(self.conv3(x)); x = self.pool3(x) # [B, 64, 8, 8]
-        
-        x = self.proj(x) # [B, H, 8, 8]
-        x = x.flatten(2).transpose(1, 2) # [B, 64, H]
-        return x
+        x = self.patch_embed(x)                        # (B, d_model, 8, 8)
+        x = x.flatten(2).transpose(1, 2)               # (B, 64, d_model)
+        cls = self.cls_token.expand(x.size(0), -1, -1) # (B, 1, d_model)
+        x = torch.cat((cls, x), dim=1) + self.pos_embed
+        x = self.norm(x)
+        return x  # (B, 65, d_model)
 
 class MultiHeadAttention(nn.Module):
     """Multi-head attention mechanism."""
@@ -164,22 +166,12 @@ class ToyVLM(nn.Module):
         self.text_processor = text_processor
         vocab_size = text_processor.tokenizer.get_vocab_size()
         
-        # Vision encoder
-        self.vision_encoder = SimpleVisionEncoder(hidden_dim)
+        # Vision encoder (ViT-style with shared d_model and positional scheme)
+        self.vision_encoder = SimpleViTEncoder(d_model=hidden_dim)
         
-        # Text embeddings
+        # Text embeddings (share same d_model and simple 1D learned positions)
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.position_embedding = nn.Embedding(MAX_SEQ_LEN, hidden_dim)
-        
-        # Vision token enhancements: positional embeddings, CLS token, and normalization
-        self.vision_pos_embedding = nn.Parameter(torch.zeros(64, hidden_dim))
-        nn.init.normal_(self.vision_pos_embedding, std=0.02)
-        self.vis_cls = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        nn.init.normal_(self.vis_cls, std=0.02)
-        self.vision_norm = nn.LayerNorm(hidden_dim)
-
-        # Vision-language fusion
-        self.vision_projection = nn.Linear(hidden_dim, hidden_dim)
         
         # Transformer decoder
         self.transformer_blocks = nn.ModuleList([
@@ -199,15 +191,8 @@ class ToyVLM(nn.Module):
         batch_size, seq_len = input_tokens.shape
         device = input_tokens.device
 
-        # Encode vision features as memory tokens
-        vision_features = self.vision_encoder(images)  # [batch, 64, hidden_dim]
-        vision_memory = self.vision_projection(vision_features)  # [batch, 64, hidden_dim]
-        # Add learned 2D positions, normalize, and prepend a visual CLS token
-        B, M, H = vision_memory.shape
-        pos = self.vision_pos_embedding[:M].unsqueeze(0).expand(B, -1, -1)
-        vision_memory = self.vision_norm(vision_memory + pos)
-        vis_cls = self.vis_cls.expand(B, 1, H)
-        vision_memory = torch.cat([vis_cls, vision_memory], dim=1)  # [batch, M+1, hidden_dim]
+        # Encode vision features as memory tokens (CLS + patches) already positioned and normalized
+        vision_memory = self.vision_encoder(images)  # [batch, 65, hidden_dim]
 
         # Embed text tokens
         token_embeds = self.token_embedding(input_tokens)  # [batch, seq_len, hidden_dim]

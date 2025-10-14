@@ -6,17 +6,21 @@ A simple VLM that can understand basic shapes and answer questions about them.
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from shapes import ShapeGenerator
 from questions import QuestionGenerator
 from text import TextProcessor, MAX_SEQ_LEN
 from model import ToyVLM, DEVICE
+import math
 
 # Training constants
-BATCH_SIZE = 32
+BATCH_SIZE = 64
+NUM_SAMPLES = 500 * BATCH_SIZE
 NUM_EPOCHS = 10
-LEARNING_RATE = 2e-4
+LEARNING_RATE = 4e-4
+WARMUP_STEPS = 500
+TOTAL_STEPS = NUM_EPOCHS * NUM_SAMPLES // BATCH_SIZE
 
 class ShapeDataset(Dataset):
     """Dataset that generates simple geometric shapes with Q&A pairs."""
@@ -66,11 +70,18 @@ def train_model(model, train_loader, num_epochs=NUM_EPOCHS):
     """Train the VLM model."""
     model = model.to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
-    scheduler = StepLR(optimizer, step_size=3, gamma=0.5)
+
+    def lr_lambda(step):
+        if step < WARMUP_STEPS:
+            return float(step + 1) / WARMUP_STEPS
+        # cosine decay after warmup
+        t = (step - WARMUP_STEPS) / max(1, TOTAL_STEPS - WARMUP_STEPS)
+        return 0.5 * (1 + math.cos(math.pi * t))
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     
     print(f"Training on {DEVICE}")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Learning rate schedule: StepLR(step_size=3, gamma=0.5)")
     
     for epoch in range(num_epochs):
         model.train()
@@ -97,16 +108,14 @@ def train_model(model, train_loader, num_epochs=NUM_EPOCHS):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            
+            scheduler.step()
+
             total_loss += loss.item()
             progress_bar.set_postfix({'loss': loss.item(), 'lr': scheduler.get_last_lr()[0]})
         
         avg_loss = total_loss / len(train_loader)
         current_lr = scheduler.get_last_lr()[0]
         print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}, Learning Rate: {current_lr:.6f}")
-        
-        # Step the scheduler
-        scheduler.step()
         
     return model
 
@@ -128,7 +137,7 @@ def main():
     model = ToyVLM(text_processor)
     
     # Create dataset with the built text processor
-    train_dataset = ShapeDataset(num_samples=10000, text_processor=text_processor)
+    train_dataset = ShapeDataset(num_samples=NUM_SAMPLES, text_processor=text_processor)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     
     # Train model
