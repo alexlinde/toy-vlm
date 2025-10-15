@@ -50,18 +50,11 @@ class SimpleTokenizer:
         # Generate samples for each shape and template
         for shape in shapes:
             for _ in range(10):  # Multiple samples per shape to get variety
-                try:
-                    question, answer = question_generator.generate_qa_pair(shape)
-                    
-                    # Extract words from question and answer
-                    q_words = self._extract_words(question)
-                    a_words = self._extract_words(answer)
-                    
-                    word_set.update(q_words)
-                    word_set.update(a_words)
-                except Exception as e:
-                    print(f"Warning: Could not generate Q&A for {shape}: {e}")
-                    continue
+                question, answer = question_generator.generate_qa_pair(shape)
+                
+                # Extract words from question and answer
+                word_set.update(self._extract_words(question))
+                word_set.update(self._extract_words(answer))
         
         # Add shape names directly to ensure they're included
         word_set.update(shapes)
@@ -73,7 +66,7 @@ class SimpleTokenizer:
         }
         word_set.update(common_words)
         
-        # Build vocabulary starting from index 4 (after special tokens)
+        # Build vocabulary starting after special tokens
         next_idx = len(self.vocab)
         for word in sorted(word_set):  # Sort for consistent ordering
             if word not in self.vocab:

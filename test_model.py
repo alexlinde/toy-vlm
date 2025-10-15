@@ -80,10 +80,10 @@ class ToyVLMGUI:
         self.history_index = -1
         
         # Image editing state
-        self.editing_mode = 'square'  # 'square', 'circle'
+        self.editing_mode = 'square'
         self.erase_mode = False
         self.tool_size = 10
-        self.canvas_scale = 300  # Scale factor from 64x64 to display size
+        self.canvas_scale = 300
         self.is_drawing = False
         
         # Initialize GUI
@@ -217,9 +217,7 @@ class ToyVLMGUI:
         """Generate a new random shape and update the display."""
         self.current_shape_type, self.current_image = self.shape_generator.generate_random_shape(add_noise=False)
         self.update_canvas_display()
-        
-        # Add to chat
-        # self.add_to_chat(f"Generated a new {self.current_shape_type}!", "System")
+        self.add_to_chat(f"Generated a new {self.current_shape_type}!", "System")
     
     def update_canvas_display(self):
         """Update the canvas with the current image."""
@@ -227,7 +225,7 @@ class ToyVLMGUI:
         img_array = (self.current_image * 255).astype(np.uint8)
         pil_img = Image.fromarray(img_array)
         self.img_size = pil_img.size
-        pil_img = pil_img.resize((self.canvas_scale, self.canvas_scale), Image.NEAREST)  # Scale up with nearest neighbor
+        pil_img = pil_img.resize((self.canvas_scale, self.canvas_scale), Image.NEAREST)
         
         self.photo = ImageTk.PhotoImage(pil_img)
         

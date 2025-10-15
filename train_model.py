@@ -26,11 +26,11 @@ TOTAL_STEPS = NUM_EPOCHS * NUM_SAMPLES // BATCH_SIZE
 class ShapeDataset(Dataset):
     """Dataset that generates simple geometric shapes with Q&A pairs."""
     
-    def __init__(self, num_samples: int, text_processor: TextProcessor = None):
+    def __init__(self, num_samples: int, text_processor: TextProcessor):
         self.num_samples = num_samples
         self.shape_generator = ShapeGenerator()
         self.question_generator = QuestionGenerator()
-        self.text_processor = text_processor or TextProcessor()
+        self.text_processor = text_processor
         
     def __len__(self):
         return self.num_samples

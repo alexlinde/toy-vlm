@@ -16,7 +16,7 @@ class TemplateLoader(BaseLoader):
         self._load_templates()
     
     def _load_templates(self):
-        """Load templates from text file with pipe-separated format."""
+        """Load templates from text file with pipe-separated question and answer"""
         self.templates_data = {}
         with open(self.templates_file, 'r') as f:
             for i, line in enumerate(f):
@@ -34,8 +34,8 @@ class TemplateLoader(BaseLoader):
 
 
 class QuestionGenerator:
-    """Generates questions about shapes using Jinja2 templates."""
-    
+    """Generates questions about shapes using Jinja2 templates."""    
+
     def __init__(self, templates_file: str = "questions.txt"):
         self.shape_generator = ShapeGenerator()
         self.shapes = self.shape_generator.get_available_shapes()
@@ -63,10 +63,6 @@ class QuestionGenerator:
         result = template.render(**context)
         
         # Split into question and answer (templates should be formatted as "question|answer")
-        if '|' in result:
-            question, answer = result.split('|', 1)
-            return question.strip(), answer.strip()
-        else:
-            # Fallback for templates that don't use the pipe separator
-            return result.strip(), f"this is a {shape_type} ."
+        question, answer = result.split('|', 1)
+        return question.strip(), answer.strip()
     

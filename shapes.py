@@ -18,7 +18,7 @@ class ShapeGenerator:
         self.shapes = ['square', 'circle', 'rectangle', 'cross', 'triangle']
     
     def generate_shape_image(self, shape_type: str, add_noise: bool) -> np.ndarray:
-        """Generate a 64x64 image with a single shape."""
+        """Generate an image with a single shape."""
         img = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
         
         # Random position and size
