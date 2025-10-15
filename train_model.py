@@ -10,7 +10,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from shapes import ShapeGenerator
 from questions import QuestionGenerator
-from text import TextProcessor, MAX_SEQ_LEN
+from text import TextProcessor
 from model import ToyVLM
 from device import DEVICE, select_amp, get_autocast_cm
 import math

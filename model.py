@@ -10,7 +10,6 @@ import numpy as np
 import math
 from text import MAX_SEQ_LEN
 from shapes import IMAGE_SIZE
-from device import DEVICE, select_amp, get_autocast_cm
 
 # Device now sourced from device.py
 HIDDEN_DIM = 256
@@ -210,52 +209,35 @@ class ToyVLM(nn.Module):
         return logits
 
 @torch.no_grad()
-def generate_response(model, image, question, max_length=30):
-    """Generate response for a given image and question."""
+def generate_response(model, image, question):
+    """Greedy-generate a response for an image and question (interactive use only)."""
     model.eval()
     device = next(model.parameters()).device
     tokenizer = model.text_processor.tokenizer
-    
-    # Prepare image
-    if isinstance(image, np.ndarray):
-        image = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
-    else:
-        image = image.to(device)
-    
-    # Tokenize question
+
+    # Prepare image tensor [1, 1, H, W]
+    image = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+
+    # Seed tokens with BOS + tokenized question
     q_tokens = tokenizer.tokenize(question)
     input_tokens = [tokenizer.bos_token_id] + q_tokens
-    
-    # Select AMP settings for inference (prefer bf16 on CUDA/MPS if possible)
-    # Choose autocast settings via shared device utilities
-    amp_conf = select_amp(device)
 
-    # Generate token by token
-    for _ in range(max_length):
-        # Prepare input tensor
-        input_tensor = torch.tensor(input_tokens, dtype=torch.long).unsqueeze(0).to(device)
-        
-        # Pad if necessary
-        if input_tensor.size(1) < MAX_SEQ_LEN:
-            padding = torch.full((1, MAX_SEQ_LEN - input_tensor.size(1)), tokenizer.pad_token_id, dtype=torch.long, device=device)
-            input_tensor = torch.cat([input_tensor, padding], dim=1)
-        
-        # Get prediction (under autocast if available)
-        autocast_cm = get_autocast_cm(amp_conf)
-        with autocast_cm:
-            logits = model(image, input_tensor)
+    # Autoregressive greedy decoding, capped to MAX_SEQ_LEN
+    for _ in range(MAX_SEQ_LEN - len(input_tokens)):
+        input_tensor = torch.tensor(input_tokens, dtype=torch.long, device=device).unsqueeze(0)
+        logits = model(image, input_tensor)
         next_token_logits = logits[0, len(input_tokens) - 1, :]
-        
-        # Sample next token (greedy decoding)
-        next_token = torch.argmax(next_token_logits).item()
-        
-        if next_token == tokenizer.eos_token_id or next_token == tokenizer.pad_token_id:
+        next_token = int(torch.argmax(next_token_logits))
+
+        if next_token in (tokenizer.eos_token_id, tokenizer.pad_token_id):
             break
-            
+
         input_tokens.append(next_token)
-    
-    # Decode response (skip START token and question tokens)
+
+        if len(input_tokens) >= MAX_SEQ_LEN:
+            break
+
+    # Decode only the generated answer portion (skip BOS and question)
     response_tokens = input_tokens[len(q_tokens) + 1:]
     response = tokenizer.decode(response_tokens)
-    
     return response
