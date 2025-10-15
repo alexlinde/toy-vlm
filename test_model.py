@@ -13,7 +13,8 @@ import threading
 
 from shapes import ShapeGenerator
 from text import SimpleTokenizer, TextProcessor
-from model import ToyVLM, DEVICE, generate_response
+from model import ToyVLM, generate_response
+from device import DEVICE
 
 def get_model_stats(model):
     """Get comprehensive model statistics."""

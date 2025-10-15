@@ -11,7 +11,8 @@ from tqdm import tqdm
 from shapes import ShapeGenerator
 from questions import QuestionGenerator
 from text import TextProcessor, MAX_SEQ_LEN
-from model import ToyVLM, DEVICE
+from model import ToyVLM
+from device import DEVICE, select_amp, get_autocast_cm
 import math
 
 # Training constants
@@ -42,26 +43,13 @@ class ShapeDataset(Dataset):
         question, answer = self.question_generator.generate_qa_pair(shape_type)
         
         # Prepare sequences using text processor
-        input_tokens, target_tokens = self.text_processor.prepare_input_sequence(question, answer)
-        
-        # Pad sequences
-        if len(input_tokens) > MAX_SEQ_LEN:
-            input_tokens = input_tokens[:MAX_SEQ_LEN]
-        if len(target_tokens) > MAX_SEQ_LEN:
-            target_tokens = target_tokens[:MAX_SEQ_LEN]
-            
-        input_len = len(input_tokens)
-        target_len = len(target_tokens)
-        
-        input_tokens = self.text_processor.pad_sequence(input_tokens)
-        target_tokens = self.text_processor.pad_sequence(target_tokens)
+        input_tokens, target_tokens, loss_mask = self.text_processor.prepare_input_sequence(question, answer)
         
         return {
             'image': torch.tensor(image, dtype=torch.float32).unsqueeze(0),  # Add channel dim
             'input_tokens': torch.tensor(input_tokens, dtype=torch.long),
             'target_tokens': torch.tensor(target_tokens, dtype=torch.long),
-            'input_len': input_len,
-            'target_len': target_len,
+            'loss_mask': torch.tensor(loss_mask, dtype=torch.bool),
             'question': question,
             'answer': answer
         }
@@ -70,6 +58,14 @@ def train_model(model, train_loader, num_epochs=NUM_EPOCHS):
     """Train the VLM model."""
     model = model.to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+
+    amp_conf = select_amp(DEVICE)
+    scaler = torch.amp.GradScaler('cuda', enabled=(amp_conf['device_type'] == 'cuda' and amp_conf['dtype'] == torch.float16))
+
+    print(
+        f"Autocast selected: device_type={amp_conf['device_type']}, "
+        f"dtype={amp_conf['dtype']}, grad_scaler={'on' if scaler.is_enabled() else 'off'}"
+    )
 
     def lr_lambda(step):
         if step < WARMUP_STEPS:
@@ -92,22 +88,30 @@ def train_model(model, train_loader, num_epochs=NUM_EPOCHS):
             images = batch['image'].to(DEVICE)
             input_tokens = batch['input_tokens'].to(DEVICE)
             target_tokens = batch['target_tokens'].to(DEVICE)
-            
-            # Forward pass
-            logits = model(images, input_tokens)
-            
-            # Compute loss
-            loss = F.cross_entropy(
-                logits.reshape(-1, model.text_processor.tokenizer.get_vocab_size()),
-                target_tokens.reshape(-1),
-                ignore_index=model.text_processor.tokenizer.pad_token_id
-            )
+            masked_targets = target_tokens.masked_fill(~batch['loss_mask'].to(DEVICE), 
+                model.text_processor.tokenizer.pad_token_id)
+
+            # Forward + loss under autocast if available
+            autocast_cm = get_autocast_cm(amp_conf)
+            with autocast_cm:
+                logits = model(images, input_tokens)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, model.text_processor.tokenizer.get_vocab_size()),
+                    masked_targets.reshape(-1),
+                    ignore_index=model.text_processor.tokenizer.pad_token_id
+                )
             
             # Backward pass
             optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             scheduler.step()
 
             total_loss += loss.item()

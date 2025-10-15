@@ -7,7 +7,6 @@ import re
 import json
 import os
 from typing import List, Set
-import torch
 
 # Token constants
 MAX_SEQ_LEN = 20
@@ -135,10 +134,7 @@ class SimpleTokenizer:
         return tokens
     
     def decode(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
-        """Convert token IDs back to text."""
-        if isinstance(tokens, torch.Tensor):
-            tokens = tokens.tolist()
-        
+        """Convert token IDs back to text."""        
         words = []
         for token_id in tokens:
             if token_id in self.idx_to_word:
@@ -166,21 +162,24 @@ class TextProcessor:
         if answer is not None:
             # Training mode - include answer
             a_tokens = self.tokenizer.tokenize(answer)
-            input_tokens = [self.tokenizer.bos_token_id] + q_tokens + a_tokens
-            target_tokens = q_tokens + a_tokens + [self.tokenizer.eos_token_id]
+            input_tokens = self.pad_sequence([self.tokenizer.bos_token_id] + q_tokens + a_tokens)
+            target_tokens = self.pad_sequence(q_tokens + a_tokens + [self.tokenizer.eos_token_id])
+            loss_mask = [0] * MAX_SEQ_LEN
+            loss_mask[len(q_tokens):len(q_tokens) + len(a_tokens) + 1] = [1] * (len(a_tokens) + 1)
         else:
             # Inference mode - only question
-            input_tokens = [self.tokenizer.bos_token_id] + q_tokens
+            input_tokens = self.pad_sequence([self.tokenizer.bos_token_id] + q_tokens)
             target_tokens = None
+            loss_mask = None
         
-        return input_tokens, target_tokens
+        return input_tokens, target_tokens, loss_mask
     
-    def pad_sequence(self, tokens: List[int], max_length: int = MAX_SEQ_LEN) -> List[int]:
+    def pad_sequence(self, tokens: List[int]) -> List[int]:
         """Pad or truncate sequence to max_length."""
-        if len(tokens) > max_length:
-            tokens = tokens[:max_length]
+        if len(tokens) > MAX_SEQ_LEN:
+            tokens = tokens[:MAX_SEQ_LEN]
         else:
-            tokens = tokens + [self.tokenizer.pad_token_id] * (max_length - len(tokens))
+            tokens = tokens + [self.tokenizer.pad_token_id] * (MAX_SEQ_LEN - len(tokens))
         return tokens
     
     def clean_response(self, response: str) -> str:

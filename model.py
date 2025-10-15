@@ -10,14 +10,9 @@ import numpy as np
 import math
 from text import MAX_SEQ_LEN
 from shapes import IMAGE_SIZE
+from device import DEVICE, select_amp, get_autocast_cm
 
-# Model constants - device fallback
-if torch.backends.mps.is_available():
-    DEVICE = torch.device('mps')
-elif torch.cuda.is_available():
-    DEVICE = torch.device('cuda')
-else:
-    DEVICE = torch.device('cpu')
+# Device now sourced from device.py
 HIDDEN_DIM = 256
 NUM_HEADS = 8
 NUM_LAYERS = 4
@@ -231,6 +226,10 @@ def generate_response(model, image, question, max_length=30):
     q_tokens = tokenizer.tokenize(question)
     input_tokens = [tokenizer.bos_token_id] + q_tokens
     
+    # Select AMP settings for inference (prefer bf16 on CUDA/MPS if possible)
+    # Choose autocast settings via shared device utilities
+    amp_conf = select_amp(device)
+
     # Generate token by token
     for _ in range(max_length):
         # Prepare input tensor
@@ -241,8 +240,10 @@ def generate_response(model, image, question, max_length=30):
             padding = torch.full((1, MAX_SEQ_LEN - input_tensor.size(1)), tokenizer.pad_token_id, dtype=torch.long, device=device)
             input_tensor = torch.cat([input_tensor, padding], dim=1)
         
-        # Get prediction
-        logits = model(image, input_tensor)
+        # Get prediction (under autocast if available)
+        autocast_cm = get_autocast_cm(amp_conf)
+        with autocast_cm:
+            logits = model(image, input_tensor)
         next_token_logits = logits[0, len(input_tokens) - 1, :]
         
         # Sample next token (greedy decoding)
