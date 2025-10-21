@@ -79,6 +79,11 @@ def train_model(model, train_loader, num_epochs, warmup_steps, total_steps, lear
         torch.cuda.set_device(local_rank)
 
     model = model.to(DEVICE)
+    # Access underlying module attributes when wrapped in DDP
+    base_model = model.module if isinstance(model, DDP) else model
+    tokenizer = base_model.text_processor.tokenizer
+    pad_token_id = tokenizer.pad_token_id
+    vocab_size = tokenizer.get_vocab_size()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
 
     amp_conf = select_amp(DEVICE)
@@ -116,17 +121,18 @@ def train_model(model, train_loader, num_epochs, warmup_steps, total_steps, lear
             images = batch['image'].to(DEVICE, non_blocking=True)
             input_tokens = batch['input_tokens'].to(DEVICE, non_blocking=True)
             target_tokens = batch['target_tokens'].to(DEVICE, non_blocking=True)
-            masked_targets = target_tokens.masked_fill(~batch['loss_mask'].to(DEVICE, non_blocking=True), 
-                model.text_processor.tokenizer.pad_token_id)
+            masked_targets = target_tokens.masked_fill(
+                ~batch['loss_mask'].to(DEVICE, non_blocking=True), pad_token_id
+            )
 
             # Forward + loss under autocast if available
             autocast_cm = get_autocast_cm(amp_conf)
             with autocast_cm:
                 logits = model(images, input_tokens)
                 loss = F.cross_entropy(
-                    logits.reshape(-1, model.text_processor.tokenizer.get_vocab_size()),
+                    logits.reshape(-1, vocab_size),
                     masked_targets.reshape(-1),
-                    ignore_index=model.text_processor.tokenizer.pad_token_id
+                    ignore_index=pad_token_id
                 )
             
             # Backward pass
