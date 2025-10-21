@@ -6,6 +6,7 @@ Loads a trained model and allows interactive Q&A with generated shapes.
 import torch
 import numpy as np
 import os
+import argparse
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 from PIL import Image, ImageTk, ImageDraw
@@ -356,8 +357,13 @@ class ToyVLMGUI:
         self.root.mainloop()
 
 def main():    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model-path', type=str, default='toy_vlm.pth', help='Path to trained model weights (.pth)')
+    parser.add_argument('--tokenizer-vocab', type=str, default='tokenizer_vocab.json', help='Path to tokenizer vocab JSON')
+    args = parser.parse_args()
+
     try:
-        gui = ToyVLMGUI()
+        gui = ToyVLMGUI(model_path=args.model_path, tokenizer_vocab=args.tokenizer_vocab)
         gui.run()
         
     except Exception as e:
