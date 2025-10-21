@@ -6,7 +6,6 @@ Contains all neural network architectures and model-related functionality.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 import math
 from text import MAX_SEQ_LEN
 from shapes import IMAGE_SIZE
@@ -15,9 +14,6 @@ from shapes import IMAGE_SIZE
 HIDDEN_DIM = 256
 NUM_HEADS = 8
 NUM_LAYERS = 4
-
-import torch
-import torch.nn as nn
 
 class SimpleViTEncoder(nn.Module):
     def __init__(self, d_model=HIDDEN_DIM, patch_size=8, image_size=IMAGE_SIZE):
