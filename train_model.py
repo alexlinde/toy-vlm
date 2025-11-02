@@ -167,9 +167,9 @@ def main():
     parser.add_argument("--backend", type=str, default="nccl", help="NCCL for CUDA, gloo for CPU-only")
     parser.add_argument("--batch-size", type=int, default=64, help="Per-process batch size")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--samples", type=int, default=None, help="Total synthetic samples (defaults to 500 * batch size)")
+    parser.add_argument("--samples", type=int, default=None, help="Total synthetic samples")
     parser.add_argument("--learning-rate", type=float, default=4e-4)
-    parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--warmup-steps", type=int, default=None, help="Warmup steps, defaults to 1% of total steps")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--save-path", type=str, default="toy_vlm.pth")
     args = parser.parse_args()
@@ -178,6 +178,8 @@ def main():
     if args.samples is None:
         args.samples = 1000 * args.batch_size
     total_steps = args.epochs * args.samples // args.batch_size
+    if args.warmup_steps is None:
+        args.warmup_steps = total_steps // 100  # 1% of total steps
 
     # Optional perf knobs
     torch.backends.cudnn.benchmark = True
