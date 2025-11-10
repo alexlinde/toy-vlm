@@ -70,21 +70,21 @@ This will train the model and save it as `toy_vlm.pth` along with the vocabulary
 - All local GPUs:
 ```bash
 torchrun --standalone --nproc_per_node=$(python -c "import torch;print(torch.cuda.device_count())") \
-  /Users/alexlinde/dev/toy-vlm/train_model.py --distributed --backend nccl --batch-size 8 --workers 8
+  train_model.py --distributed --backend nccl --batch-size 8 --workers 8
 ```
 
 - Specific number of GPUs (e.g., 4):
 ```bash
 torchrun --standalone --nproc_per_node=4 \
-  /Users/alexlinde/dev/toy-vlm/train_model.py --distributed --backend nccl --batch-size 8 --workers 8
+  train_model.py --distributed --backend nccl --batch-size 8 --workers 8
 ```
 
 - Single GPU (or run without DDP):
 ```bash
 torchrun --standalone --nproc_per_node=1 \
-  /Users/alexlinde/dev/toy-vlm/train_model.py --distributed --backend nccl
+  train_model.py --distributed --backend nccl
 # or
-python /Users/alexlinde/dev/toy-vlm/train_model.py
+python train_model.py
 ```
 
 Notes:

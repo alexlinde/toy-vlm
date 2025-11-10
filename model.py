@@ -173,9 +173,9 @@ class ToyVLM(nn.Module):
         self.dropout = nn.Dropout(0.1)
         
     def create_causal_mask(self, seq_len, device):
-        """Create causal mask for autoregressive generation."""
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
-        return mask == 0
+        base = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+        # allowed = lower-tri including diag
+        return ~base  # True = keep, False = mask
     
     def forward(self, images, input_tokens):
         batch_size, seq_len = input_tokens.shape
