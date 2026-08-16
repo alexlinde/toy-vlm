@@ -63,7 +63,8 @@ class MultiHeadAttention(nn.Module):
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
         
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
+            # dtype-aware "-inf": a hard-coded -1e9 overflows to -inf in fp16
+            scores = scores.masked_fill(mask == 0, torch.finfo(scores.dtype).min)
         
         attention = F.softmax(scores, dim=-1)
         context = torch.matmul(attention, V)

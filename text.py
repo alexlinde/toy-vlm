@@ -37,35 +37,36 @@ class SimpleTokenizer:
         self.unk_token_id = self.vocab['<UNK>']
     
     def build_vocab_from_questions(self, question_generator):
-        """Build vocabulary by analyzing all possible questions and answers."""
+        """Build vocabulary by deterministically enumerating every template.
+
+        Renders every template in questions.txt for every shape, with the
+        `random_other_shape` slot also ranging over every shape, so the
+        vocabulary covers every word that could ever be rendered and is
+        independent of RNG state (unlike random sampling, which could miss a
+        rarely-drawn template's unique word).
+        """
         from shapes import ShapeGenerator
-        
+
         # Get all shape types
         shape_gen = ShapeGenerator()
         shapes = shape_gen.get_available_shapes()
-        
+
         # Collect all unique words from questions and answers
         word_set = set()
-        
-        # Generate samples for each shape and template
-        for shape in shapes:
-            for _ in range(10):  # Multiple samples per shape to get variety
-                question, answer = question_generator.generate_qa_pair(shape)
-                
-                # Extract words from question and answer
-                word_set.update(self._extract_words(question))
-                word_set.update(self._extract_words(answer))
-        
+
+        # Render every template for every (shape, random_other_shape) pair
+        for template_name in question_generator.template_names:
+            template = question_generator.env.get_template(template_name)
+            for shape in shapes:
+                for other_shape in shapes:
+                    result = template.render(shape=shape, random_other_shape=other_shape)
+                    question, answer = result.split('|', 1)
+                    word_set.update(self._extract_words(question.strip()))
+                    word_set.update(self._extract_words(answer.strip()))
+
         # Add shape names directly to ensure they're included
         word_set.update(shapes)
-        
-        # Add common shape-related words that might be missing
-        common_words = {
-            'shape', 'round', 'flat', 'big', 'small', 'object', 'figure',
-            'red', 'blue', 'green', 'white', 'black', 'color', 'size'
-        }
-        word_set.update(common_words)
-        
+
         # Build vocabulary starting after special tokens
         next_idx = len(self.vocab)
         for word in sorted(word_set):  # Sort for consistent ordering
@@ -155,6 +156,14 @@ class TextProcessor:
         if answer is not None:
             # Training mode - include answer
             a_tokens = self.tokenizer.tokenize(answer)
+            # BOS + question + answer + EOS must fit in MAX_SEQ_LEN, or the loss_mask
+            # slice assignment below would silently extend past it (collate crash).
+            needed = len(q_tokens) + len(a_tokens) + 2
+            assert needed <= MAX_SEQ_LEN, (
+                f"Sequence too long for MAX_SEQ_LEN={MAX_SEQ_LEN}: "
+                f"question={question!r} ({len(q_tokens)} tokens), "
+                f"answer={answer!r} ({len(a_tokens)} tokens), needed={needed}"
+            )
             input_tokens = self.pad_sequence([self.tokenizer.bos_token_id] + q_tokens + a_tokens)
             target_tokens = self.pad_sequence(q_tokens + a_tokens + [self.tokenizer.eos_token_id])
             loss_mask = [0] * MAX_SEQ_LEN

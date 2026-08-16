@@ -1,0 +1,12 @@
+[project]
+name = "toy-vlm"
+version = "0.1.0"
+description = "A minimal toy Vision-Language Model demonstrating multimodal AI in as little code as possible."
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "numpy",
+    "tqdm",
+    "jinja2",
+    "pillow",
+]

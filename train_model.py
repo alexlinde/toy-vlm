@@ -4,8 +4,10 @@ A simple VLM that can understand basic shapes and answer questions about them.
 """
 import os
 import math
+import random
 import argparse
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -19,7 +21,27 @@ from text import TextProcessor
 from model import ToyVLM
 from device import DEVICE, select_amp, get_autocast_cm
 
- 
+
+def set_seed(seed: int):
+    """Seed the RNGs used for data generation and model init."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def worker_init_fn(worker_id):
+    """Give each DataLoader worker its own RNG state.
+
+    On fork-start platforms (Linux/CUDA, i.e. the DDP cloud path), workers
+    otherwise inherit identical `random`/`np.random` state and generate
+    duplicate sample streams. Seed from torch's per-worker initial seed,
+    which is already distinct per worker (and per epoch, when persistent
+    workers are off).
+    """
+    seed = torch.initial_seed() % 2**32
+    random.seed(seed)
+    np.random.seed(seed)
+
 
 class ShapeDataset(Dataset):
     """Dataset that generates simple geometric shapes with Q&A pairs."""
@@ -169,9 +191,10 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--samples", type=int, default=None, help="Total synthetic samples")
     parser.add_argument("--learning-rate", type=float, default=4e-4)
-    parser.add_argument("--warmup-steps", type=int, default=None, help="Warmup steps, defaults to 1% of total steps")
+    parser.add_argument("--warmup-steps", type=int, default=None, help="Warmup steps, defaults to 1%% of total steps")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--save-path", type=str, default="toy_vlm.pth")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed (offset by rank under --distributed)")
     args = parser.parse_args()
 
     # Derive dependent values
@@ -187,6 +210,12 @@ def main():
     rank, world_size = 0, 1
     if args.distributed:
         rank, world_size = init_distributed(args.backend)
+
+    # Seed data/model RNGs, offset by rank so each DDP process (and its
+    # DataLoader workers, via worker_init_fn) draws a distinct sample stream.
+    # DDP broadcasts rank 0's model weights at construction, so per-rank model
+    # init need not match beforehand.
+    set_seed(args.seed + rank)
 
     is_main = (rank == 0)
     if is_main:
@@ -226,7 +255,8 @@ def main():
         sampler=sampler,
         num_workers=args.workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=(args.workers > 0)
+        persistent_workers=(args.workers > 0),
+        worker_init_fn=worker_init_fn if args.workers > 0 else None,
     )
     
     # Train model
