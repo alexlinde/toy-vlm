@@ -134,4 +134,27 @@ See `pyproject.toml` for the complete list of dependencies:
 
 1. **Limited question variety**: Only 12 basic templates in questions.txt
 2. **Simple vocabulary**: Vocab may need expansion for complex questions
-5. **Sequence length**: 20 tokens may be limiting for longer conversations
+3. **Sequence length**: 20 tokens may be limiting for longer conversations
+
+## Deliberate Simplicity Choices
+
+A few places where this code intentionally differs from modern transformer
+practice. Each alternative is load-bearing at some scale of depth, vocabulary,
+or precision — and this project sits comfortably below all of those
+thresholds, so the simpler (or more default) version is kept for readability:
+
+- **Post-norm blocks** (`norm(x + sublayer(x))`, the original 2017 layout).
+  Modern stacks use pre-norm because post-norm destabilizes training past
+  ~10-12 layers without careful warmup. At 4 layers the gradient path is
+  short enough that it trains without issue.
+- **No weight tying** between the token embedding and the output projection.
+  Tying saves parameters when the vocabulary is large relative to the model;
+  with a 29-token vocab the untied head costs ~0.25% of total parameters,
+  and separate matrices are easier to reason about.
+- **Default N(0,1) embedding init** instead of GPT-style N(0, 0.02). The
+  small init matters mainly when the embedding is *tied* to the output head
+  (unit-variance weights there produce huge initial logits); untied, with a
+  LayerNorm downstream of the embedding sum, the default is harmless.
+
+If you copy this code into a deeper, larger-vocab, or tied-head model, revisit
+all three.
