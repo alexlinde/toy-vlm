@@ -3,6 +3,7 @@ Model components for the Toy VLM.
 Contains all neural network architectures and model-related functionality.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,12 +15,16 @@ from shapes import IMAGE_SIZE
 HIDDEN_DIM = 256
 NUM_HEADS = 8
 NUM_LAYERS = 4
+PATCH_SIZE = 8
+PATCH_GRID = IMAGE_SIZE // PATCH_SIZE          # 8 patches per side
+NUM_PATCHES = PATCH_GRID ** 2                  # 64 patch tokens, plus CLS = 65
+PROBE_FEATURE_DIM = NUM_PATCHES * HIDDEN_DIM
 # Longest trained answer is 5 words plus EOS; a question leaving fewer
 # generation slots than that would silently truncate (or empty) the answer.
 MAX_ANSWER_TOKENS = 6
 
 class SimpleViTEncoder(nn.Module):
-    def __init__(self, d_model=HIDDEN_DIM, patch_size=8, image_size=IMAGE_SIZE):
+    def __init__(self, d_model=HIDDEN_DIM, patch_size=PATCH_SIZE, image_size=IMAGE_SIZE):
         super().__init__()
         self.patch_embed = nn.Conv2d(
             1, d_model, kernel_size=patch_size, stride=patch_size
@@ -96,6 +101,10 @@ class CrossAttention(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
 
+        # Last attention map, kept only at inference time for introspection
+        # (the GUI's attention heatmap); left None while training.
+        self.last_attention = None
+
     def forward(self, query, memory):
         batch_size = query.size(0)
 
@@ -107,6 +116,8 @@ class CrossAttention(nn.Module):
         # Attention (no masking for cross-attention)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
         attention = F.softmax(scores, dim=-1)
+        if not self.training:
+            self.last_attention = attention.detach()  # (B, heads, q_len, kv_len)
         context = torch.matmul(attention, V)
 
         # Concatenate heads
@@ -213,12 +224,57 @@ class ToyVLM(nn.Module):
 
         return logits
 
+def vision_probe_features(model, images):
+    """Frozen vision features the shape probe reads: the flattened patch grid.
+
+    Deliberately *not* the CLS token. SimpleViTEncoder has no self-attention
+    layers, so nothing ever mixes patch content into CLS: its output is a
+    learned constant, identical for every image, and a probe on it is provably
+    stuck at chance. The patch tokens are where this encoder's view of the
+    image actually lives. Returns (B, PROBE_FEATURE_DIM).
+    """
+    return model.vision_encoder(images)[:, 1:].flatten(1)
+
+
+class ShapeProbe(nn.Module):
+    """Linear probe over the frozen vision patch embeddings, classifying the shape."""
+
+    def __init__(self, classes, d_model=PROBE_FEATURE_DIM):
+        super().__init__()
+        self.classes = list(classes)
+        self.linear = nn.Linear(d_model, len(self.classes))
+        # Temperature-scaling factor fitted on held-out data after training,
+        # so displayed probabilities are calibrated rather than overconfident
+        # (the raw probe reads ~100% on predictions that are right ~half the time).
+        self.register_buffer('temperature', torch.ones(()))
+
+    def forward(self, features):  # (B, d_model) -> (B, num_classes)
+        return self.linear(features) / self.temperature
+
+
+@torch.no_grad()
+def shape_probe_probabilities(model, probe, image):
+    """Classify the image with the linear probe on the frozen vision patch
+    embeddings. image is a (64,64) float numpy array. Returns {class: prob}."""
+    model.eval()
+    device = next(model.parameters()).device
+    probe = probe.to(device)  # idempotent when already there
+    probe.eval()
+
+    image_tensor = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+    features = vision_probe_features(model, image_tensor)
+    probs = F.softmax(probe(features).float(), dim=-1)[0]
+
+    return dict(zip(probe.classes, probs.tolist()))
+
+
 def load_trained_model(checkpoint_path: str):
-    """Load a trained ToyVLM and its tokenizer from a checkpoint.
+    """Load a trained ToyVLM, its tokenizer, and its shape probe from a checkpoint.
 
     Checkpoints bundle the vocabulary with the weights so the pair can never
-    mismatch. Returns (model, tokenizer) on CPU; the caller moves the model
-    to its device.
+    mismatch. Returns (model, tokenizer, probe) on CPU; the caller moves the
+    model to its device. The probe is optional -- checkpoints trained before it
+    existed load fine and yield probe=None.
     """
     ckpt = torch.load(checkpoint_path, map_location='cpu')
 
@@ -236,12 +292,29 @@ def load_trained_model(checkpoint_path: str):
     model.load_state_dict(ckpt['state_dict'])
     model.eval()
 
-    return model, tokenizer
+    probe = None
+    if 'probe' in ckpt and 'probe_classes' in ckpt:
+        # Size the probe from its own saved weights, so a checkpoint stays
+        # loadable if the feature the probe reads is ever changed.
+        probe = ShapeProbe(ckpt['probe_classes'], d_model=ckpt['probe']['linear.weight'].shape[1])
+        probe.load_state_dict(ckpt['probe'])
+        probe.eval()
+
+    return model, tokenizer, probe
 
 
 @torch.no_grad()
-def generate_response(model, image, question):
-    """Greedy-generate a response for an image and question (interactive use only)."""
+def generate_response_traced(model, image, question, top_k=3):
+    """Greedy-generate a response, plus a per-token introspection trace.
+
+    Returns (response, trace). trace has one dict per generated token -- so its
+    entries line up 1:1 with the words of the returned response -- each with:
+      'word'      the chosen token's word
+      'prob'      that token's softmax probability
+      'top_k'     [(word, prob), ...] for the top_k tokens, descending
+      'attention' (8, 8) float32 cross-attention over the image patches,
+                  averaged across layers and heads (CLS column dropped)
+    """
     model.eval()
     device = next(model.parameters()).device
     tokenizer = model.text_processor.tokenizer
@@ -258,15 +331,41 @@ def generate_response(model, image, question):
             f"Question too long: {len(q_tokens)} words, max {MAX_SEQ_LEN - MAX_ANSWER_TOKENS - 1}"
         )
 
+    trace = []
+
     # Autoregressive greedy decoding, capped to MAX_SEQ_LEN
     for _ in range(MAX_SEQ_LEN - len(input_tokens)):
         input_tensor = torch.tensor(input_tokens, dtype=torch.long, device=device).unsqueeze(0)
         logits = model(image, input_tensor)
-        next_token_logits = logits[0, len(input_tokens) - 1, :]
+        pos = len(input_tokens) - 1  # position whose logits choose the next token
+        next_token_logits = logits[0, pos, :]
         next_token = int(torch.argmax(next_token_logits))
 
         if next_token in (tokenizer.eos_token_id, tokenizer.pad_token_id):
             break
+
+        probs = F.softmax(next_token_logits.float(), dim=-1)
+        top_probs, top_indices = torch.topk(probs, min(top_k, probs.numel()))
+
+        # Cross-attention this token paid to the vision memory, meaned over
+        # layers and heads; index 0 is the CLS token, the rest is the 8x8 grid.
+        attention = torch.stack([
+            block.cross_attention.last_attention[0, :, pos, :]
+            for block in model.transformer_blocks
+        ]).float().mean(dim=(0, 1))                     # (layers, heads, 65) -> (65,)
+        patch_attention = (
+            attention[1:].reshape(PATCH_GRID, PATCH_GRID).cpu().numpy().astype(np.float32)
+        )
+
+        trace.append({
+            'word': tokenizer.idx_to_word[next_token],
+            'prob': float(probs[next_token]),
+            'top_k': [
+                (tokenizer.idx_to_word[int(idx)], float(p))
+                for p, idx in zip(top_probs.tolist(), top_indices.tolist())
+            ],
+            'attention': patch_attention,
+        })
 
         input_tokens.append(next_token)
 
@@ -276,4 +375,10 @@ def generate_response(model, image, question):
     # Decode only the generated answer portion (skip BOS and question)
     response_tokens = input_tokens[len(q_tokens) + 1:]
     response = tokenizer.decode(response_tokens)
-    return response
+    return response, trace
+
+
+@torch.no_grad()
+def generate_response(model, image, question):
+    """Greedy-generate a response for an image and question (interactive use only)."""
+    return generate_response_traced(model, image, question)[0]

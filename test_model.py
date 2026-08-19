@@ -12,7 +12,7 @@ from PIL import Image, ImageTk, ImageDraw
 import threading
 
 from shapes import ShapeGenerator
-from model import load_trained_model, generate_response
+from model import load_trained_model, generate_response_traced, shape_probe_probabilities
 from device import DEVICE
 
 def get_model_stats(model):
@@ -58,32 +58,38 @@ class ToyVLMGUI:
     """Tkinter GUI for the Toy VLM."""
     
     def __init__(self, model_path='toy_vlm.pth'):
-        # Initialize model + tokenizer via the shared loader (the checkpoint
-        # bundles its vocab so they can never mismatch)
-        self.model, self.tokenizer = load_trained_model(model_path)
+        # Initialize model + tokenizer + shape probe via the shared loader (the
+        # checkpoint bundles its vocab so they can never mismatch). The probe is
+        # optional: checkpoints trained before it existed yield None.
+        self.model, self.tokenizer, self.probe = load_trained_model(model_path)
         self.text_processor = self.model.text_processor
         self.model.to(DEVICE)
 
         self.shape_generator = ShapeGenerator()
-        
+
         self.current_shape_type = None
         self.current_image = None
-        
+
         # Question history for navigation
         self.question_history = []
         self.history_index = -1
-        
+
         # Image editing state
         self.editing_mode = 'square'
         self.erase_mode = False
         self.tool_size = 10
         self.canvas_scale = 300
         self.is_drawing = False
-        
+
+        # Introspection state: an (8, 8) patch-grid attention map, or None
+        # when there is nothing to overlay.
+        self.attention_map = None
+        self._message_counter = 0
+
         # Initialize GUI
         self.root = tk.Tk()
         self.root.title("Toy Vision-Language Model")
-        self.root.geometry("800x500")
+        self.root.geometry("800x680")
         self.setup_gui()
         
         # Generate initial shape
@@ -140,7 +146,23 @@ class ToyVLMGUI:
         # Generate new shape button
         ttk.Button(edit_frame, text="New Shape", command=self.generate_new_shape).pack(pady=5, side=tk.LEFT)
 
-                
+        # Attention overlay toggle
+        self.show_attention_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(edit_frame, text="Show attention", variable=self.show_attention_var,
+                        command=self.update_canvas_display).pack(pady=5, side=tk.LEFT, padx=10)
+
+        # Live shape beliefs from the linear probe on the vision patch embeddings
+        self.belief_canvas = tk.Canvas(left_frame, width=self.canvas_scale, height=110,
+                                       bg='white', highlightthickness=0)
+        self.belief_canvas.pack(fill=tk.X, pady=(5, 0))
+
+        # Attention inspector readout
+        self.inspector_label = ttk.Label(
+            left_frame, text="ask a question to see attention",
+            wraplength=self.canvas_scale, font=('TkDefaultFont', 9), justify=tk.LEFT,
+        )
+        self.inspector_label.pack(fill=tk.X, pady=(4, 0))
+
         # Right panel for chat
         right_frame = ttk.Frame(main_frame)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
@@ -210,23 +232,78 @@ class ToyVLMGUI:
     def generate_new_shape(self):
         """Generate a new random shape and update the display."""
         self.current_shape_type, self.current_image = self.shape_generator.generate_random_shape(add_noise=False)
+        # Any attention map refers to the image being replaced.
+        self.attention_map = None
         self.update_canvas_display()
         self.add_to_chat(f"Generated a new {self.current_shape_type}!", "System")
-    
+        self.update_shape_beliefs()
+
     def update_canvas_display(self):
-        """Update the canvas with the current image."""
+        """Update the canvas with the current image (plus attention overlay)."""
         # Convert numpy array to PIL Image and then to PhotoImage
         img_array = (self.current_image * 255).astype(np.uint8)
         pil_img = Image.fromarray(img_array)
         self.img_size = pil_img.size
+
+        if self.attention_map is not None and self.show_attention_var.get():
+            pil_img = self._blend_attention(pil_img, self.attention_map)
+
         pil_img = pil_img.resize((self.canvas_scale, self.canvas_scale), Image.NEAREST)
-        
+
         self.photo = ImageTk.PhotoImage(pil_img)
-        
+
         # Clear canvas and display image
         self.canvas.delete("all")
         self.canvas.create_image(150, 150, image=self.photo, anchor='center')
-        
+
+    def _blend_attention(self, pil_img, attention_map):
+        """Blend an (8, 8) attention map over the grayscale image as red heat."""
+        peak = float(attention_map.max())
+        if peak <= 0:
+            return pil_img.convert('RGB')
+
+        # Upsample the patch grid to image resolution
+        heat_img = Image.fromarray(
+            ((attention_map / peak) * 255).astype(np.uint8), mode='L'
+        ).resize(pil_img.size, Image.BILINEAR)
+        heat = np.asarray(heat_img, dtype=np.float32) / 255.0
+
+        # Lerp each pixel toward red; the shape stays visible underneath
+        base = np.asarray(pil_img.convert('RGB'), dtype=np.float32)
+        alpha = (0.55 * heat)[..., None]
+        red = np.array([255.0, 40.0, 40.0], dtype=np.float32)
+        blended = base * (1.0 - alpha) + red * alpha
+        return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), mode='RGB')
+
+    def update_shape_beliefs(self):
+        """Redraw the vision probe's shape probabilities as horizontal bars."""
+        self.belief_canvas.delete("all")
+
+        if self.probe is None:
+            self.belief_canvas.create_text(
+                8, 14, anchor='w', fill='#777777', font=('TkDefaultFont', 9),
+                text="no probe in checkpoint — retrain to enable",
+            )
+            return
+
+        probabilities = shape_probe_probabilities(self.model, self.probe, self.current_image)
+        best = max(probabilities, key=probabilities.get)
+
+        label_right = 70          # right edge of the fixed name column
+        bar_left = label_right + 6
+        bar_max = self.canvas_scale - bar_left - 44
+        for row, (name, prob) in enumerate(probabilities.items()):
+            y = 12 + row * 20
+            self.belief_canvas.create_text(label_right, y, anchor='e', text=name,
+                                           font=('TkDefaultFont', 9))
+            width = max(1, int(round(bar_max * prob)))
+            fill = '#2e7d32' if name == best else '#a5d6a7'
+            self.belief_canvas.create_rectangle(bar_left, y - 6, bar_left + width, y + 6,
+                                                fill=fill, outline='')
+            self.belief_canvas.create_text(bar_left + width + 5, y, anchor='w',
+                                           text=f"{100 * prob:.0f}%",
+                                           font=('TkDefaultFont', 8))
+
     def on_enter_pressed(self, event):
         """Handle Enter key press in question entry."""
         self.ask_question()
@@ -300,14 +377,95 @@ class ToyVLMGUI:
     def _process_question(self, question, image):
         """Process the question in a background thread."""
         try:
-            response = generate_response(self.model, image, question)
+            response, trace = generate_response_traced(self.model, image, question)
         except Exception as e:
             self.root.after(0, self.add_to_chat, f"Error: {e}", "System")
             return
 
         # Update GUI in main thread
-        self.root.after(0, self.add_to_chat, response, "VLM")
-    
+        self.root.after(0, self._deliver_response, image, response, trace)
+
+    @staticmethod
+    def _confidence_color(prob):
+        """Chat background colour for a token's confidence."""
+        if prob >= 0.9:
+            return '#c8e6c9'  # green
+        if prob >= 0.6:
+            return '#ffe0b2'  # amber
+        return '#ffcdd2'      # red
+
+    def _deliver_response(self, image, response, trace):
+        """Render the answer in the chat, colour-coded by per-token confidence."""
+        if not trace:
+            # Empty generation: nothing to colour or inspect.
+            self.add_to_chat(response, "VLM")
+        else:
+            self._message_counter += 1
+            msg = self._message_counter
+
+            self.chat_display.config(state='normal')
+            self.chat_display.insert(tk.END, "🎯 ")
+            for i, entry in enumerate(trace):
+                tag = f"tok{msg}_{i}"
+                self.chat_display.insert(tk.END, entry['word'], tag)
+                self.chat_display.insert(tk.END, " ")
+                self.chat_display.tag_config(tag, background=self._confidence_color(entry['prob']))
+                # Bind this word to its own trace and image snapshot, so words
+                # in older answers keep inspecting their own tokens after newer
+                # answers arrive.
+                self.chat_display.tag_bind(
+                    tag, "<Button-1>",
+                    lambda event, tr=trace, img=image, idx=i: self._inspect_token(tr, img, idx)
+                )
+            self.chat_display.insert(tk.END, "\n")
+
+            # Dim per-token confidence line, with the runner-up where it matters
+            parts = []
+            for entry in trace:
+                part = f"{entry['word']} {100 * entry['prob']:.0f}%"
+                alternatives = [(w, p) for w, p in entry['top_k'] if w != entry['word']]
+                if alternatives and alternatives[0][1] >= 0.05:
+                    part += f" ({alternatives[0][0]} {100 * alternatives[0][1]:.0f}%)"
+                parts.append(part)
+
+            conf_tag = f"conf{msg}"
+            self.chat_display.insert(tk.END, ' · '.join(parts) + "\n\n", conf_tag)
+            self.chat_display.tag_config(conf_tag, foreground='#777777',
+                                         font=('TkDefaultFont', 8))
+
+            self.chat_display.config(state='disabled')
+            self.chat_display.see(tk.END)
+
+        # Only overlay when the answer is still about what's on screen: the user
+        # may have drawn or generated a new shape while inference was running.
+        if trace and np.array_equal(image, self.current_image):
+            self.attention_map = np.mean([entry['attention'] for entry in trace], axis=0)
+            self.update_canvas_display()
+            self.inspector_label.config(
+                text="attention: answer average — click an answer word to inspect a token"
+            )
+
+    def _inspect_token(self, trace, image, i):
+        """Show the attention map and alternatives for one answer token."""
+        if not np.array_equal(image, self.current_image):
+            self.inspector_label.config(
+                text="image changed — attention for this answer no longer applies"
+            )
+            return
+
+        entry = trace[i]
+        self.attention_map = entry['attention']
+
+        text = f"'{entry['word']}' {100 * entry['prob']:.0f}%"
+        alternatives = [(w, p) for w, p in entry['top_k'] if w != entry['word']]
+        if alternatives:
+            text += " · alternatives: " + ", ".join(
+                f"{w} {100 * p:.0f}%" for w, p in alternatives
+            )
+        self.inspector_label.config(text=text)
+        self.update_canvas_display()
+
+
     def on_tool_change(self):
         """Handle tool selection change."""
         self.editing_mode = self.tool_var.get()
@@ -335,7 +493,10 @@ class ToyVLMGUI:
         """Handle mouse release on canvas."""
         _ = event  # Unused parameter
         self.is_drawing = False
-    
+        # The image changed under the probe; refresh its beliefs once the
+        # interaction ends rather than on every drag event.
+        self.update_shape_beliefs()
+
     def draw_at_position(self, canvas_x, canvas_y):
         """Draw at the specified canvas position."""
         # Convert canvas coordinates to image coordinates (300x300 -> 64x64)
@@ -349,6 +510,9 @@ class ToyVLMGUI:
     
     def draw_shape(self, shape_type, center_x, center_y, size, fill_color):
         """Draw or erase a shape at the specified position using Pillow."""
+        # Any attention map refers to the image before this edit.
+        self.attention_map = None
+
         # Convert numpy array to PIL Image
         pil_img = Image.fromarray((self.current_image * 255).astype(np.uint8))
         draw = ImageDraw.Draw(pil_img)

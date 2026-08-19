@@ -18,7 +18,7 @@ from tqdm import tqdm
 from shapes import ShapeGenerator
 from questions import QuestionGenerator
 from text import TextProcessor
-from model import ToyVLM
+from model import ToyVLM, ShapeProbe, vision_probe_features
 from device import DEVICE, select_amp, get_autocast_cm
 
 
@@ -182,8 +182,82 @@ def train_model(model, train_loader, num_epochs, warmup_steps, total_steps, lear
             avg_loss = total_loss / len(train_loader)
             current_lr = scheduler.get_last_lr()[0]
             print(f"Epoch {epoch+1} - Average Loss: {avg_loss:.4f}, Learning Rate: {current_lr:.6f}")
-        
+
     return model
+
+
+def train_shape_probe(model, num_samples=12000, epochs=20, batch_size=256):
+    """Train a linear probe on the frozen vision patch embeddings to classify
+    the shape; returns (probe, holdout_accuracy)."""
+    model.eval()
+
+    shape_generator = ShapeGenerator()
+    classes = shape_generator.get_available_shapes()
+    class_to_idx = {name: idx for idx, name in enumerate(classes)}
+
+    # Half noisy (like training images), half clean (like the GUI's canvas),
+    # so the probe serves both distributions.
+    images, labels = [], []
+    for i in range(num_samples):
+        shape_type, image = shape_generator.generate_random_shape(add_noise=(i % 2 == 0))
+        images.append(image)
+        labels.append(class_to_idx[shape_type])
+
+    images = torch.tensor(np.stack(images), dtype=torch.float32).unsqueeze(1)  # (N, 1, H, W)
+    labels = torch.tensor(labels, dtype=torch.long, device=DEVICE)
+
+    # Extract the frozen vision features once; the probe then trains on features
+    # alone, which is why this takes seconds rather than minutes.
+    feature_batches = []
+    with torch.no_grad():
+        for start in range(0, len(images), batch_size):
+            batch = images[start:start + batch_size].to(DEVICE)
+            feature_batches.append(vision_probe_features(model, batch))
+    features = torch.cat(feature_batches)
+
+    split = int(0.8 * len(features))
+    train_x, train_y = features[:split], labels[:split]
+    holdout_x, holdout_y = features[split:], labels[split:]
+
+    probe = ShapeProbe(classes, d_model=features.shape[-1]).to(DEVICE)
+    optimizer = torch.optim.Adam(probe.parameters(), lr=1e-2)
+
+    probe.train()
+    for _ in range(epochs):
+        perm = torch.randperm(len(train_x), device=DEVICE)
+        for start in range(0, len(perm), batch_size):
+            idx = perm[start:start + batch_size]
+            loss = F.cross_entropy(probe(train_x[idx]), train_y[idx])
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+    probe.eval()
+    with torch.no_grad():
+        raw_logits = probe.linear(holdout_x)
+        accuracy = (raw_logits.argmax(dim=-1) == holdout_y).float().mean().item()
+
+    # Temperature scaling on the holdout so the probabilities the GUI shows
+    # are calibrated (temperature=1 leaves the argmax, and thus accuracy,
+    # unchanged -- only the confidence spread moves).
+    log_t = torch.zeros((), device=DEVICE, requires_grad=True)
+    t_optimizer = torch.optim.LBFGS([log_t], lr=0.1, max_iter=50)
+
+    def _nll_closure():
+        t_optimizer.zero_grad()
+        loss = F.cross_entropy(raw_logits / log_t.exp(), holdout_y)
+        loss.backward()
+        return loss
+
+    t_optimizer.step(_nll_closure)
+    with torch.no_grad():
+        probe.temperature.fill_(log_t.exp().item())
+
+    print(
+        f"Shape probe holdout accuracy: {100 * accuracy:.1f}% "
+        f"({len(holdout_x)} held-out samples), temperature {probe.temperature.item():.2f}"
+    )
+    return probe, accuracy
 
 
 def main():
@@ -278,10 +352,19 @@ def main():
     # Save model from rank 0 only
     if is_main:
         module = model.module if isinstance(model, DDP) else model
+        # A linear readout of the frozen vision patch embeddings, for the GUI's
+        # live shape-belief bars. Cheap: features are extracted once, then the
+        # probe trains on them alone.
+        probe, _ = train_shape_probe(module)
         # Bundle the vocab with the weights so a checkpoint can never be paired
         # with a vocab that shifted ids under it (same size, different mapping).
         torch.save(
-            {'state_dict': module.state_dict(), 'vocab': text_processor.tokenizer.vocab},
+            {
+                'state_dict': module.state_dict(),
+                'vocab': text_processor.tokenizer.vocab,
+                'probe': probe.state_dict(),
+                'probe_classes': probe.classes,
+            },
             args.save_path,
         )
         print("Training complete. Model and tokenizer saved.")

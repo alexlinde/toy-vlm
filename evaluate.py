@@ -83,7 +83,7 @@ def main():
 
     # Load tokenizer + model via the shared loader (the checkpoint bundles
     # its vocab so they can never mismatch).
-    model, tokenizer = load_trained_model(args.checkpoint)
+    model, tokenizer, _ = load_trained_model(args.checkpoint)
     model.to(DEVICE)
     print(f"Loaded checkpoint '{args.checkpoint}' onto device: {DEVICE}\n")
 

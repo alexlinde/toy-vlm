@@ -24,7 +24,7 @@ This is a toy Vision-Language Model (VLM) implementation in PyTorch that demonst
   - Shared embedding dimension across image and text; both use learned positional embeddings
   
 - **SimpleTokenizer**: Custom word-based tokenizer for shape domain
-  - Vocabulary: 29 tokens, built deterministically by enumerating every question/answer template in `questions.txt` for every shape
+  - Vocabulary: 42 tokens, built deterministically by enumerating every question/answer template in `questions.txt` for every shape
   - Alpha-only preprocessing: strips punctuation and normalizes text
   - Special tokens: `<PAD>`, `<START>`, `<END>`, `<UNK>`
   - Max sequence length: 20 tokens
@@ -104,6 +104,17 @@ Launches a Tkinter GUI for visual interaction with the trained model.
 - **Auto-focus**: Question input box has focus by default for immediate typing
 - **Real-time Interaction**: Ask questions about generated shapes and get instant responses
 
+#### Model Introspection
+Each answer word is background-coloured by the model's confidence in that token, with
+the runner-up alternatives listed underneath. Click a word to paint its cross-attention
+over the image as a red heatmap (averaged across layers and heads; toggle with **Show
+attention**) — the answer's average map is shown by default. Under the drawing tools, a
+linear probe on the frozen vision patch embeddings reports live shape probabilities as
+bars, updating as you draw. The probe is trained at the end of `train_model.py` and bundled
+into the checkpoint; older checkpoints without one simply show a note instead of the bars.
+It reads the patch tokens rather than the CLS token because `SimpleViTEncoder` has no
+self-attention, so its CLS output is a learned constant that carries no image information.
+
 ### Evaluation
 ```bash
 uv run python evaluate.py
@@ -133,7 +144,7 @@ See `pyproject.toml` for the complete list of dependencies:
 
 ## Known Limitations
 
-1. **Limited question variety**: Only 12 basic templates in questions.txt
+1. **Limited question variety**: Only 24 basic templates in questions.txt
 2. **Simple vocabulary**: Vocab may need expansion for complex questions
 3. **Sequence length**: 20 tokens may be limiting for longer conversations
 
@@ -150,7 +161,7 @@ thresholds, so the simpler (or more default) version is kept for readability:
   short enough that it trains without issue.
 - **No weight tying** between the token embedding and the output projection.
   Tying saves parameters when the vocabulary is large relative to the model;
-  with a 29-token vocab the untied head costs ~0.25% of total parameters,
+  with a 42-token vocab the untied head costs ~0.4% of total parameters,
   and separate matrices are easier to reason about.
 - **Default N(0,1) embedding init** instead of GPT-style N(0, 0.02). The
   small init matters mainly when the embedding is *tied* to the output head
