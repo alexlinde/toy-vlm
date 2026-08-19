@@ -109,7 +109,7 @@ def train_model(model, train_loader, num_epochs, warmup_steps, total_steps, lear
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
 
     amp_conf = select_amp(DEVICE)
-    scaler = torch.amp.GradScaler('cuda', enabled=(amp_conf['device_type'] == 'cuda' and amp_conf['dtype'] == torch.float16))
+    scaler = torch.amp.GradScaler('cuda', enabled=amp_conf['use_scaler'])
 
     if is_main:
         print(
@@ -120,8 +120,9 @@ def train_model(model, train_loader, num_epochs, warmup_steps, total_steps, lear
     def lr_lambda(step):
         if step < warmup_steps:
             return float(step + 1) / warmup_steps
-        # cosine decay after warmup
-        t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        # cosine decay after warmup; clamp so overshooting total_steps holds the
+        # LR at the floor instead of walking back up the far side of the cosine.
+        t = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
         return 0.5 * (1 + math.cos(math.pi * t))
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
@@ -161,6 +162,9 @@ def train_model(model, train_loader, num_epochs, warmup_steps, total_steps, lear
             optimizer.zero_grad(set_to_none=True)
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
+                # Clip in unscaled space: clipping scaled grads would renormalize
+                # to 1.0 at scale ~65536 and collapse the effective step.
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
@@ -189,20 +193,18 @@ def main():
     parser.add_argument("--backend", type=str, default="nccl", help="NCCL for CUDA, gloo for CPU-only")
     parser.add_argument("--batch-size", type=int, default=64, help="Per-process batch size")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--samples", type=int, default=None, help="Total synthetic samples")
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=64000,
+        help="Total synthetic samples across all ranks (default: 64000)",
+    )
     parser.add_argument("--learning-rate", type=float, default=4e-4)
     parser.add_argument("--warmup-steps", type=int, default=None, help="Warmup steps, defaults to 1%% of total steps")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--save-path", type=str, default="toy_vlm.pth")
     parser.add_argument("--seed", type=int, default=0, help="Random seed (offset by rank under --distributed)")
     args = parser.parse_args()
-
-    # Derive dependent values
-    if args.samples is None:
-        args.samples = 1000 * args.batch_size
-    total_steps = args.epochs * args.samples // args.batch_size
-    if args.warmup_steps is None:
-        args.warmup_steps = total_steps // 100  # 1% of total steps
 
     # Optional perf knobs
     torch.backends.cudnn.benchmark = True
@@ -227,11 +229,7 @@ def main():
     question_gen = QuestionGenerator()
     text_processor = TextProcessor()
     text_processor.tokenizer.build_vocab_from_questions(question_gen)
-    
-    # Save the tokenizer vocabulary only on rank 0
-    if is_main:
-        text_processor.tokenizer.save_vocab('tokenizer_vocab.json')
-    
+
     # Create model with the built tokenizer
     model = ToyVLM(text_processor)
 
@@ -258,7 +256,14 @@ def main():
         persistent_workers=(args.workers > 0),
         worker_init_fn=worker_init_fn if args.workers > 0 else None,
     )
-    
+
+    # Derive the schedule from the loader itself: len(train_loader) is this
+    # rank's steps per epoch, already accounting for the DistributedSampler
+    # split and for drop_last=False rounding up on a partial final batch.
+    total_steps = args.epochs * len(train_loader)
+    if args.warmup_steps is None:
+        args.warmup_steps = total_steps // 100  # 1% of total steps
+
     # Train model
     model = train_model(
         model,
@@ -273,7 +278,12 @@ def main():
     # Save model from rank 0 only
     if is_main:
         module = model.module if isinstance(model, DDP) else model
-        torch.save(module.state_dict(), args.save_path)
+        # Bundle the vocab with the weights so a checkpoint can never be paired
+        # with a vocab that shifted ids under it (same size, different mapping).
+        torch.save(
+            {'state_dict': module.state_dict(), 'vocab': text_processor.tokenizer.vocab},
+            args.save_path,
+        )
         print("Training complete. Model and tokenizer saved.")
 
     if is_distributed():

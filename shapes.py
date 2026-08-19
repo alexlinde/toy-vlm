@@ -59,10 +59,10 @@ class ShapeGenerator:
             thickness = random.randint(3, 7)
             length = random.randint(15, 30)
             
-            # Horizontal line
-            img[cy-thickness:cy+thickness, cx-length:cx+length] = 1.0
+            # Horizontal line (clamp slice starts to 0; negative starts would wrap to an empty slice)
+            img[max(0, cy-thickness):cy+thickness, max(0, cx-length):cx+length] = 1.0
             # Vertical line
-            img[cy-length:cy+length, cx-thickness:cx+thickness] = 1.0
+            img[max(0, cy-length):cy+length, max(0, cx-thickness):cx+thickness] = 1.0
             
         elif shape_type == 'triangle':
             # Generate proper triangle with three vertices

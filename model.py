@@ -7,13 +7,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from text import MAX_SEQ_LEN
+from text import MAX_SEQ_LEN, SimpleTokenizer, TextProcessor
 from shapes import IMAGE_SIZE
 
 # Device now sourced from device.py
 HIDDEN_DIM = 256
 NUM_HEADS = 8
 NUM_LAYERS = 4
+# Longest trained answer is 5 words plus EOS; a question leaving fewer
+# generation slots than that would silently truncate (or empty) the answer.
+MAX_ANSWER_TOKENS = 6
 
 class SimpleViTEncoder(nn.Module):
     def __init__(self, d_model=HIDDEN_DIM, patch_size=8, image_size=IMAGE_SIZE):
@@ -172,7 +175,12 @@ class ToyVLM(nn.Module):
         # Output projection
         self.output_projection = nn.Linear(hidden_dim, vocab_size)
         self.dropout = nn.Dropout(0.1)
-        
+
+        # <UNK> never occurs in the exhaustively-enumerated training data, so its
+        # randomly-initialized embedding would survive training as pure noise.
+        with torch.no_grad():
+            self.token_embedding.weight[text_processor.tokenizer.unk_token_id].zero_()
+
     def create_causal_mask(self, seq_len, device):
         base = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
         # allowed = lower-tri including diag
@@ -205,6 +213,32 @@ class ToyVLM(nn.Module):
 
         return logits
 
+def load_trained_model(checkpoint_path: str):
+    """Load a trained ToyVLM and its tokenizer from a checkpoint.
+
+    Checkpoints bundle the vocabulary with the weights so the pair can never
+    mismatch. Returns (model, tokenizer) on CPU; the caller moves the model
+    to its device.
+    """
+    ckpt = torch.load(checkpoint_path, map_location='cpu')
+
+    if not (isinstance(ckpt, dict) and 'state_dict' in ckpt and 'vocab' in ckpt):
+        raise ValueError(
+            f"'{checkpoint_path}' is not a bundled checkpoint (expected keys "
+            "'state_dict' and 'vocab'); retrain with train_model.py"
+        )
+
+    tokenizer = SimpleTokenizer.from_vocab(ckpt['vocab'])
+    text_processor = TextProcessor()
+    text_processor.tokenizer = tokenizer
+
+    model = ToyVLM(text_processor)
+    model.load_state_dict(ckpt['state_dict'])
+    model.eval()
+
+    return model, tokenizer
+
+
 @torch.no_grad()
 def generate_response(model, image, question):
     """Greedy-generate a response for an image and question (interactive use only)."""
@@ -218,6 +252,11 @@ def generate_response(model, image, question):
     # Seed tokens with BOS + tokenized question
     q_tokens = tokenizer.tokenize(question)
     input_tokens = [tokenizer.bos_token_id] + q_tokens
+
+    if len(input_tokens) > MAX_SEQ_LEN - MAX_ANSWER_TOKENS:
+        raise ValueError(
+            f"Question too long: {len(q_tokens)} words, max {MAX_SEQ_LEN - MAX_ANSWER_TOKENS - 1}"
+        )
 
     # Autoregressive greedy decoding, capped to MAX_SEQ_LEN
     for _ in range(MAX_SEQ_LEN - len(input_tokens)):

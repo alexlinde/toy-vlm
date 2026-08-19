@@ -4,8 +4,6 @@ Handles tokenization and text-related functionality.
 """
 
 import re
-import json
-import os
 from typing import List, Set
 
 # Token constants
@@ -14,16 +12,12 @@ MAX_SEQ_LEN = 20
 class SimpleTokenizer:
     """Simple word-based tokenizer for the toy VLM."""
     
-    def __init__(self, vocab_file: str = None):
-        if vocab_file and os.path.exists(vocab_file):
-            # Load pretrained vocabulary
-            self.load_vocab(vocab_file)
-        else:
-            # Initialize with base vocabulary - will be extended during training
-            self.vocab = {
-                '<PAD>': 0, '<START>': 1, '<END>': 2, '<UNK>': 3
-            }
-            self._update_mappings()
+    def __init__(self):
+        # Initialize with base vocabulary - will be extended during training
+        self.vocab = {
+            '<PAD>': 0, '<START>': 1, '<END>': 2, '<UNK>': 3
+        }
+        self._update_mappings()
     
     def _update_mappings(self):
         """Update reverse mapping and special token IDs."""
@@ -85,24 +79,12 @@ class SimpleTokenizer:
         normalized = self._preprocess_text(text)
         return set(normalized.split()) if normalized else set()
     
-    def save_vocab(self, vocab_file: str):
-        """Save vocabulary to file."""
-        with open(vocab_file, 'w') as f:
-            json.dump(self.vocab, f, indent=2, sort_keys=True)
-        print(f"Saved vocabulary to {vocab_file}")
-    
-    def load_vocab(self, vocab_file: str):
-        """Load vocabulary from file."""
-        with open(vocab_file, 'r') as f:
-            self.vocab = json.load(f)
-        self._update_mappings()
-        print(f"Loaded vocabulary with {len(self.vocab)} tokens from {vocab_file}")
-    
     @classmethod
-    def load_pretrained(cls, vocab_file: str):
-        """Create tokenizer instance from saved vocabulary."""
+    def from_vocab(cls, vocab: dict):
+        """Create tokenizer instance from an in-memory vocabulary dict."""
         tokenizer = cls()
-        tokenizer.load_vocab(vocab_file)
+        tokenizer.vocab = dict(vocab)
+        tokenizer._update_mappings()
         return tokenizer
     
     def _preprocess_text(self, text: str) -> str:
@@ -133,7 +115,7 @@ class SimpleTokenizer:
         for token_id in tokens:
             if token_id in self.idx_to_word:
                 word = self.idx_to_word[token_id]
-                if skip_special_tokens and word.startswith('<') and word.endswith('>'):
+                if skip_special_tokens and word.startswith('<') and word.endswith('>') and word != '<UNK>':
                     continue
                 words.append(word)
         
@@ -142,6 +124,17 @@ class SimpleTokenizer:
     def get_vocab_size(self) -> int:
         """Return vocabulary size."""
         return len(self.vocab)
+
+    def oov_words(self, text: str) -> List[str]:
+        """Return the unique out-of-vocabulary words in text, in first-seen order."""
+        words = self._preprocess_text(text).split()
+        seen = set()
+        result = []
+        for word in words:
+            if word not in self.vocab and word not in seen:
+                seen.add(word)
+                result.append(word)
+        return result
 
 class TextProcessor:
     """Handles text processing tasks for the VLM."""

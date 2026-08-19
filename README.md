@@ -45,7 +45,7 @@ Current hyperparameters:
 - Transformer: 4 layers, 8 attention heads  
 - Max sequence length: 20 tokens
 - Batch size: 64
-- Samples: 1000 × BATCH_SIZE (default 64k)
+- Samples: 64k by default (total across all ranks, independent of batch size)
 - Training epochs: 10
 - Learning rate: 4e-4
 - Optimizer: AdamW (weight_decay 0.01)
@@ -64,7 +64,8 @@ uv sync
 ```bash
 uv run python train_model.py
 ```
-This will train the model and save it as `toy_vlm.pth` along with the vocabulary.
+This will train the model and save it as `toy_vlm.pth` with the vocabulary
+bundled inside the checkpoint, so the weights and vocab can never mismatch.
 
 ### Single-node multi-GPU training with torchrun
 

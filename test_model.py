@@ -3,7 +3,6 @@ Interactive execution module for the Toy VLM.
 Loads a trained model and allows interactive Q&A with generated shapes.
 """
 
-import torch
 import numpy as np
 import os
 import argparse
@@ -13,8 +12,7 @@ from PIL import Image, ImageTk, ImageDraw
 import threading
 
 from shapes import ShapeGenerator
-from text import SimpleTokenizer, TextProcessor
-from model import ToyVLM, generate_response
+from model import load_trained_model, generate_response
 from device import DEVICE
 
 def get_model_stats(model):
@@ -59,18 +57,13 @@ def format_number(num):
 class ToyVLMGUI:
     """Tkinter GUI for the Toy VLM."""
     
-    def __init__(self, model_path='toy_vlm.pth', tokenizer_vocab='tokenizer_vocab.json'):
-        # Initialize text processing with pretrained tokenizer
-        self.tokenizer = SimpleTokenizer.load_pretrained(tokenizer_vocab)
-        self.text_processor = TextProcessor()
-        self.text_processor.tokenizer = self.tokenizer
-        
-        # Initialize model components
-        self.model = ToyVLM(self.text_processor)
-        self.model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    def __init__(self, model_path='toy_vlm.pth'):
+        # Initialize model + tokenizer via the shared loader (the checkpoint
+        # bundles its vocab so they can never mismatch)
+        self.model, self.tokenizer = load_trained_model(model_path)
+        self.text_processor = self.model.text_processor
         self.model.to(DEVICE)
-        self.model.eval()
-        
+
         self.shape_generator = ShapeGenerator()
         
         self.current_shape_type = None
@@ -285,14 +278,33 @@ class ToyVLMGUI:
         
         # Add question to chat
         self.add_to_chat(question, "User")
-        
-        # Process in background thread to avoid freezing GUI
-        threading.Thread(target=self._process_question, args=(question,), daemon=True).start()
-    
-    def _process_question(self, question):
+
+        # Warn about words the model was never trained on -- it will treat
+        # them as untrained <UNK> noise rather than genuinely understanding them.
+        oov = self.tokenizer.oov_words(question)
+        if oov:
+            self.add_to_chat(
+                f"Note: not in the model's vocabulary: {', '.join(oov)} — it cannot understand these words.",
+                "System",
+            )
+
+        # Process in background thread to avoid freezing GUI. Snapshot the
+        # current image now so a later New Shape / draw doesn't change which
+        # image the answer is about.
+        threading.Thread(
+            target=self._process_question,
+            args=(question, self.current_image.copy()),
+            daemon=True,
+        ).start()
+
+    def _process_question(self, question, image):
         """Process the question in a background thread."""
-        response = generate_response(self.model, self.current_image, question)
-        
+        try:
+            response = generate_response(self.model, image, question)
+        except Exception as e:
+            self.root.after(0, self.add_to_chat, f"Error: {e}", "System")
+            return
+
         # Update GUI in main thread
         self.root.after(0, self.add_to_chat, response, "VLM")
     
@@ -358,16 +370,15 @@ class ToyVLMGUI:
 
 def main():    
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model-path', type=str, default='toy_vlm.pth', help='Path to trained model weights (.pth)')
-    parser.add_argument('--tokenizer-vocab', type=str, default='tokenizer_vocab.json', help='Path to tokenizer vocab JSON')
+    parser.add_argument('--model-path', type=str, default='toy_vlm.pth', help='Path to trained model checkpoint (.pth)')
     args = parser.parse_args()
 
     try:
-        gui = ToyVLMGUI(model_path=args.model_path, tokenizer_vocab=args.tokenizer_vocab)
-        gui.run()
-        
+        gui = ToyVLMGUI(model_path=args.model_path)
     except Exception as e:
         print(f"❌ Error loading model: {e}")
+        return
+    gui.run()
 
 if __name__ == "__main__":
     main()
