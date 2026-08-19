@@ -108,12 +108,21 @@ Launches a Tkinter GUI for visual interaction with the trained model.
 Each answer word is background-coloured by the model's confidence in that token, with
 the runner-up alternatives listed underneath. Click a word to paint its cross-attention
 over the image as a red heatmap (averaged across layers and heads; toggle with **Show
-attention**) — the answer's average map is shown by default. Under the drawing tools, a
-linear probe on the frozen vision patch embeddings reports live shape probabilities as
-bars, updating as you draw. The probe is trained at the end of `train_model.py` and bundled
-into the checkpoint; older checkpoints without one simply show a note instead of the bars.
-It reads the patch tokens rather than the CLS token because `SimpleViTEncoder` has no
-self-attention, so its CLS output is a learned constant that carries no image information.
+attention**) — the answer's average map is shown by default. Under the drawing tools,
+two live shape-probability bar sets update as you draw:
+
+- **model** (blue): the model's own belief, read from its language head by internally
+  asking "what shape is this" and taking the next-token distribution at the shape slot.
+- **vision tower** (green): a linear probe on the frozen vision patch embeddings,
+  trained at the end of `train_model.py`, temperature-calibrated, and bundled into the
+  checkpoint (older checkpoints without one show a note instead).
+
+The gap between the two is the interesting part: the probe tops out around ~57%
+(vs 20% chance) while the full model is near-perfect, showing that shape recognition
+in this architecture happens in the decoder's cross-attention, not the vision encoder.
+The probe reads the patch tokens rather than the CLS token because `SimpleViTEncoder`
+has no self-attention, so its CLS output is a learned constant that carries no image
+information.
 
 ### Evaluation
 ```bash

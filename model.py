@@ -268,6 +268,36 @@ def shape_probe_probabilities(model, probe, image):
     return dict(zip(probe.classes, probs.tolist()))
 
 
+@torch.no_grad()
+def model_shape_beliefs(model, image, shape_names):
+    """The model's own belief about the shape, read from its language head.
+
+    Asks the model 'what shape is this' with the trained answer preamble
+    'this is a' teacher-forced, then reads the next-token distribution at the
+    slot where the shape name goes, renormalized over shape_names. Unlike the
+    linear probe (which sees only the frozen vision patch embeddings), this
+    uses the full network -- cross-attention is where shape recognition
+    actually happens in this architecture. Returns {shape: prob}.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    tokenizer = model.text_processor.tokenizer
+
+    image_tensor = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+    tokens = (
+        [tokenizer.bos_token_id]
+        + tokenizer.tokenize('what shape is this')
+        + tokenizer.tokenize('this is a')
+    )
+    input_tensor = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+
+    logits = model(image_tensor, input_tensor)[0, len(tokens) - 1, :]
+    shape_ids = [tokenizer.vocab[name] for name in shape_names]
+    probs = F.softmax(logits[shape_ids].float(), dim=-1)
+
+    return dict(zip(shape_names, probs.tolist()))
+
+
 def load_trained_model(checkpoint_path: str):
     """Load a trained ToyVLM, its tokenizer, and its shape probe from a checkpoint.
 

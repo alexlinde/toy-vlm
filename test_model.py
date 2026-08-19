@@ -12,7 +12,12 @@ from PIL import Image, ImageTk, ImageDraw
 import threading
 
 from shapes import ShapeGenerator
-from model import load_trained_model, generate_response_traced, shape_probe_probabilities
+from model import (
+    load_trained_model,
+    generate_response_traced,
+    shape_probe_probabilities,
+    model_shape_beliefs,
+)
 from device import DEVICE
 
 def get_model_stats(model):
@@ -89,7 +94,7 @@ class ToyVLMGUI:
         # Initialize GUI
         self.root = tk.Tk()
         self.root.title("Toy Vision-Language Model")
-        self.root.geometry("800x680")
+        self.root.geometry("800x720")
         self.setup_gui()
         
         # Generate initial shape
@@ -151,8 +156,9 @@ class ToyVLMGUI:
         ttk.Checkbutton(edit_frame, text="Show attention", variable=self.show_attention_var,
                         command=self.update_canvas_display).pack(pady=5, side=tk.LEFT, padx=10)
 
-        # Live shape beliefs from the linear probe on the vision patch embeddings
-        self.belief_canvas = tk.Canvas(left_frame, width=self.canvas_scale, height=110,
+        # Live shape beliefs: the model's own (language head) next to what the
+        # vision tower alone can tell (linear probe on patch embeddings)
+        self.belief_canvas = tk.Canvas(left_frame, width=self.canvas_scale, height=160,
                                        bg='white', highlightthickness=0)
         self.belief_canvas.pack(fill=tk.X, pady=(5, 0))
 
@@ -276,33 +282,61 @@ class ToyVLMGUI:
         return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), mode='RGB')
 
     def update_shape_beliefs(self):
-        """Redraw the vision probe's shape probabilities as horizontal bars."""
+        """Redraw shape beliefs: the model's own (from its language head) as
+        blue bars, paired with the vision-tower linear probe as green bars.
+        The gap between the two is the point -- shape recognition happens in
+        cross-attention, not in the vision encoder."""
         self.belief_canvas.delete("all")
 
-        if self.probe is None:
-            self.belief_canvas.create_text(
-                8, 14, anchor='w', fill='#777777', font=('TkDefaultFont', 9),
-                text="no probe in checkpoint — retrain to enable",
-            )
-            return
+        shapes = self.shape_generator.get_available_shapes()
+        model_beliefs = model_shape_beliefs(self.model, self.current_image, shapes)
+        probe_beliefs = (
+            shape_probe_probabilities(self.model, self.probe, self.current_image)
+            if self.probe is not None else None
+        )
 
-        probabilities = shape_probe_probabilities(self.model, self.probe, self.current_image)
-        best = max(probabilities, key=probabilities.get)
+        # Legend
+        self.belief_canvas.create_rectangle(8, 6, 18, 14, fill='#1565c0', outline='')
+        self.belief_canvas.create_text(22, 10, anchor='w', text="model",
+                                       font=('TkDefaultFont', 8))
+        self.belief_canvas.create_rectangle(70, 6, 80, 14, fill='#2e7d32', outline='')
+        self.belief_canvas.create_text(84, 10, anchor='w', text="vision tower",
+                                       font=('TkDefaultFont', 8))
+        if probe_beliefs is None:
+            self.belief_canvas.create_text(
+                160, 10, anchor='w', fill='#777777', font=('TkDefaultFont', 8),
+                text="(no probe in checkpoint)",
+            )
+
+        best_model = max(model_beliefs, key=model_beliefs.get)
+        best_probe = max(probe_beliefs, key=probe_beliefs.get) if probe_beliefs else None
 
         label_right = 70          # right edge of the fixed name column
         bar_left = label_right + 6
         bar_max = self.canvas_scale - bar_left - 44
-        for row, (name, prob) in enumerate(probabilities.items()):
-            y = 12 + row * 20
+        for row, name in enumerate(shapes):
+            y = 32 + row * 26
             self.belief_canvas.create_text(label_right, y, anchor='e', text=name,
                                            font=('TkDefaultFont', 9))
+
+            prob = model_beliefs[name]
             width = max(1, int(round(bar_max * prob)))
-            fill = '#2e7d32' if name == best else '#a5d6a7'
-            self.belief_canvas.create_rectangle(bar_left, y - 6, bar_left + width, y + 6,
+            fill = '#1565c0' if name == best_model else '#90caf9'
+            self.belief_canvas.create_rectangle(bar_left, y - 9, bar_left + width, y - 2,
                                                 fill=fill, outline='')
-            self.belief_canvas.create_text(bar_left + width + 5, y, anchor='w',
+            self.belief_canvas.create_text(bar_left + width + 5, y - 5, anchor='w',
                                            text=f"{100 * prob:.0f}%",
-                                           font=('TkDefaultFont', 8))
+                                           font=('TkDefaultFont', 7))
+
+            if probe_beliefs is not None:
+                prob = probe_beliefs[name]
+                width = max(1, int(round(bar_max * prob)))
+                fill = '#2e7d32' if name == best_probe else '#a5d6a7'
+                self.belief_canvas.create_rectangle(bar_left, y + 2, bar_left + width, y + 9,
+                                                    fill=fill, outline='')
+                self.belief_canvas.create_text(bar_left + width + 5, y + 5, anchor='w',
+                                               text=f"{100 * prob:.0f}%",
+                                               font=('TkDefaultFont', 7))
 
     def on_enter_pressed(self, event):
         """Handle Enter key press in question entry."""
