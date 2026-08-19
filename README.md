@@ -49,7 +49,7 @@ Current hyperparameters:
 - Training epochs: 10
 - Learning rate: 4e-4
 - Optimizer: AdamW (weight_decay 0.01)
-- Scheduler: LambdaLR with linear warmup (defaults to 1% of total steps) and cosine decay over TOTAL_STEPS
+- Scheduler: LambdaLR with linear warmup (defaults to 1% of total steps) and cosine decay to zero over the run (total steps are derived from the actual DataLoader length, so the schedule stays correct under DDP and partial final batches)
 
 ## Installation
 
@@ -64,8 +64,9 @@ uv sync
 ```bash
 uv run python train_model.py
 ```
-This will train the model and save it as `toy_vlm.pth` with the vocabulary
-bundled inside the checkpoint, so the weights and vocab can never mismatch.
+This will train the model and save it as `toy_vlm.pth` with the vocabulary and
+the calibrated shape probe bundled inside the checkpoint, so the weights, vocab,
+and probe can never mismatch.
 
 ### Single-node multi-GPU training with torchrun
 
@@ -103,6 +104,8 @@ Launches a Tkinter GUI for visual interaction with the trained model.
 - **Question History**: Navigate previous questions using ↑/↓ arrow keys
 - **Auto-focus**: Question input box has focus by default for immediate typing
 - **Real-time Interaction**: Ask questions about generated shapes and get instant responses
+- **Drawing Tools**: Draw or erase squares and circles directly on the canvas to edit the image the model sees
+- **Vocabulary Warnings**: Questions containing words the model was never trained on get a note in the chat
 
 #### Model Introspection
 Each answer word is background-coloured by the model's confidence in that token, with
@@ -132,8 +135,10 @@ Measures exact-match accuracy of greedy generation against `--checkpoint` (defau
 `toy_vlm.pth`), sampling `--samples` random shapes per question template (default 200)
 from `questions.txt`. Reports per-template accuracy plus rollups for three families -
 **identification** (open "what shape is this"-style questions), **yes** and **no**
-(positive/negative verification questions) - each against its own majority-class
-baseline, along with overall accuracy and counts of empty generations/exceptions.
+(positive/negative verification questions) - each against its template-memorization
+baseline (the `Base%` column): the accuracy a predictor could reach by memorizing the
+majority gold answer per template without looking at the image. Overall accuracy and
+counts of empty generations/exceptions round out the table.
 
 By default images are clean (noise-free), matching the interactive GUI; pass `--noise`
 to evaluate under the noisier conditions used during training. Useful flags:
@@ -170,7 +175,7 @@ thresholds, so the simpler (or more default) version is kept for readability:
   short enough that it trains without issue.
 - **No weight tying** between the token embedding and the output projection.
   Tying saves parameters when the vocabulary is large relative to the model;
-  with a 42-token vocab the untied head costs ~0.4% of total parameters,
+  with a 42-token vocab the untied head costs ~0.25% of total parameters,
   and separate matrices are easier to reason about.
 - **Default N(0,1) embedding init** instead of GPT-style N(0, 0.02). The
   small init matters mainly when the embedding is *tied* to the output head
