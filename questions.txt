@@ -8,6 +8,18 @@ can you see a {{ shape }}|yes i can
 can you see a {{ random_other_shape }}|no
 is there a {{ shape }} in the image|yes there is
 is there a {{ random_other_shape }} in the image|not that i can see
-is there a {{ shape }}|yes 
+is there a {{ shape }}|yes
 is there a {{ random_other_shape }}|nope
+describe the image|the image shows a {{ shape }}
+tell me what you see|i can see a {{ shape }}
+what is in the picture|there is a {{ shape }}
+name the shape|it is a {{ shape }}
+do you see a {{ shape }}|yes i do
+does the image contain a {{ shape }}|yes it does
+is the shape a {{ shape }}|yes it is
+am i looking at a {{ shape }}|yes you are
+do you see a {{ random_other_shape }}|no i do not
+does the image contain a {{ random_other_shape }}|no it does not
+is the shape a {{ random_other_shape }}|no it is a {{ shape }}
+is this a {{ random_other_shape }} or a {{ shape }}|it is a {{ shape }}
 
