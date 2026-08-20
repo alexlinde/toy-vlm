@@ -44,49 +44,20 @@ class SimpleViTEncoder(nn.Module):
         return x  # (B, 65, d_model)
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head attention mechanism."""
-    
-    def __init__(self, d_model, num_heads):
-        super().__init__()
-        assert d_model % num_heads == 0
-        
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
-        
-        self.W_q = nn.Linear(d_model, d_model)
-        self.W_k = nn.Linear(d_model, d_model)
-        self.W_v = nn.Linear(d_model, d_model)
-        self.W_o = nn.Linear(d_model, d_model)
-        
-    def forward(self, query, key, value, mask=None):
-        batch_size = query.size(0)
-        
-        # Linear transformations and reshape
-        Q = self.W_q(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        K = self.W_k(key).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        V = self.W_v(value).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        
-        # Attention
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        
-        if mask is not None:
-            # dtype-aware "-inf": a hard-coded -1e9 overflows to -inf in fp16
-            scores = scores.masked_fill(mask == 0, torch.finfo(scores.dtype).min)
-        
-        attention = F.softmax(scores, dim=-1)
-        context = torch.matmul(attention, V)
-        
-        # Concatenate heads
-        context = context.transpose(1, 2).contiguous().view(
-            batch_size, -1, self.d_model
-        )
-        
-        output = self.W_o(context)
-        return output
+    """Multi-head attention, used for both the self- and cross-attention slots.
 
-class CrossAttention(nn.Module):
-    """Cross-attention mechanism for text attending to vision features."""
+    `forward(x)` attends x to itself; `forward(x, memory)` attends x to memory.
+    The two differ only in where K and V come from, so one class covers both --
+    the block still owns them under separate names, so each keeps its own
+    weights.
+
+    Attention capture is opt-in: set `store_attention = True` and every forward
+    stashes its post-softmax weights, detached, in `last_attention`
+    (B, heads, q_len, kv_len). Off by default, because building that matrix is
+    the only reason not to let F.scaled_dot_product_attention fuse the whole
+    thing. generate_response_traced turns it on for the cross-attention slots,
+    which is what the GUI heatmap reads.
+    """
 
     def __init__(self, d_model, num_heads):
         super().__init__()
@@ -101,32 +72,33 @@ class CrossAttention(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
 
-        # Last attention map, kept only at inference time for introspection
-        # (the GUI's attention heatmap); left None while training.
+        # Plain attributes, not buffers: nothing here belongs in a checkpoint.
+        self.store_attention = False
         self.last_attention = None
 
-    def forward(self, query, memory):
-        batch_size = query.size(0)
+    def forward(self, x, memory=None, mask=None):
+        B, T, _ = x.shape
+        kv = x if memory is None else memory
 
-        # Linear transformations and reshape
-        Q = self.W_q(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        K = self.W_k(memory).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        V = self.W_v(memory).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        def heads(proj, t):
+            return proj(t).view(B, t.size(1), self.num_heads, self.d_k).transpose(1, 2)
 
-        # Attention (no masking for cross-attention)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        attention = F.softmax(scores, dim=-1)
-        if not self.training:
-            self.last_attention = attention.detach()  # (B, heads, q_len, kv_len)
-        context = torch.matmul(attention, V)
+        Q, K, V = heads(self.W_q, x), heads(self.W_k, kv), heads(self.W_v, kv)
 
-        # Concatenate heads
-        context = context.transpose(1, 2).contiguous().view(
-            batch_size, -1, self.d_model
-        )
+        if self.store_attention:
+            scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_k)
+            if mask is not None:
+                # mask: bool, True = keep. A hard-coded -1e9 would overflow to
+                # -inf in fp16, so take the dtype's own floor.
+                scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+            attention = F.softmax(scores, dim=-1)
+            self.last_attention = attention.detach()
+            context = attention @ V
+        else:
+            context = F.scaled_dot_product_attention(Q, K, V, attn_mask=mask)
 
-        output = self.W_o(context)
-        return output
+        return self.W_o(context.transpose(1, 2).reshape(B, T, self.d_model))
+
 
 class TransformerBlock(nn.Module):
     """Transformer decoder block with cross-attention to vision features."""
@@ -134,7 +106,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, d_model, num_heads):
         super().__init__()
         self.self_attention = MultiHeadAttention(d_model, num_heads)
-        self.cross_attention = CrossAttention(d_model, num_heads)
+        self.cross_attention = MultiHeadAttention(d_model, num_heads)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
@@ -148,11 +120,11 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x, vision_memory, mask=None):
         # Self-attention
-        attn_output = self.self_attention(x, x, x, mask)
+        attn_output = self.self_attention(x, mask=mask)
         x = self.norm1(x + attn_output)
 
         # Cross-attention to vision features
-        cross_attn_output = self.cross_attention(x, vision_memory)
+        cross_attn_output = self.cross_attention(x, memory=vision_memory)
         x = self.norm2(x + cross_attn_output)
 
         # Feed-forward
@@ -193,9 +165,8 @@ class ToyVLM(nn.Module):
             self.token_embedding.weight[text_processor.tokenizer.unk_token_id].zero_()
 
     def create_causal_mask(self, seq_len, device):
-        base = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
-        # allowed = lower-tri including diag
-        return ~base  # True = keep, False = mask
+        # True = keep: lower triangle including the diagonal.
+        return torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
     
     def forward(self, images, input_tokens):
         batch_size, seq_len = input_tokens.shape
@@ -334,16 +305,12 @@ def load_trained_model(checkpoint_path: str):
 
 
 @torch.no_grad()
-def generate_response_traced(model, image, question, top_k=3):
-    """Greedy-generate a response, plus a per-token introspection trace.
+def _generate(model, image, question, top_k=3, with_trace=False):
+    """Greedy decode. Builds the introspection trace only when asked for it.
 
-    Returns (response, trace). trace has one dict per generated token -- so its
-    entries line up 1:1 with the words of the returned response -- each with:
-      'word'      the chosen token's word
-      'prob'      that token's softmax probability
-      'top_k'     [(word, prob), ...] for the top_k tokens, descending
-      'attention' (8, 8) float32 cross-attention over the image patches,
-                  averaged across layers and heads (CLS column dropped)
+    Cross-attention capture costs a materialized (q_len, kv_len) matrix per
+    layer per step, so it is switched on for the duration of a traced call and
+    off again afterwards -- an untraced call never pays for it.
     """
     model.eval()
     device = next(model.parameters()).device
@@ -362,45 +329,53 @@ def generate_response_traced(model, image, question, top_k=3):
         )
 
     trace = []
+    for block in model.transformer_blocks:
+        block.cross_attention.store_attention = with_trace
 
-    # Autoregressive greedy decoding, capped to MAX_SEQ_LEN
-    for _ in range(MAX_SEQ_LEN - len(input_tokens)):
-        input_tensor = torch.tensor(input_tokens, dtype=torch.long, device=device).unsqueeze(0)
-        logits = model(image, input_tensor)
-        pos = len(input_tokens) - 1  # position whose logits choose the next token
-        next_token_logits = logits[0, pos, :]
-        next_token = int(torch.argmax(next_token_logits))
+    try:
+        # Autoregressive greedy decoding, capped to MAX_SEQ_LEN
+        for _ in range(MAX_SEQ_LEN - len(input_tokens)):
+            input_tensor = torch.tensor(input_tokens, dtype=torch.long, device=device).unsqueeze(0)
+            logits = model(image, input_tensor)
+            pos = len(input_tokens) - 1  # position whose logits choose the next token
+            next_token_logits = logits[0, pos, :]
+            next_token = int(torch.argmax(next_token_logits))
 
-        if next_token in (tokenizer.eos_token_id, tokenizer.pad_token_id):
-            break
+            if next_token in (tokenizer.eos_token_id, tokenizer.pad_token_id):
+                break
 
-        probs = F.softmax(next_token_logits.float(), dim=-1)
-        top_probs, top_indices = torch.topk(probs, min(top_k, probs.numel()))
+            if with_trace:
+                probs = F.softmax(next_token_logits.float(), dim=-1)
+                top_probs, top_indices = torch.topk(probs, min(top_k, probs.numel()))
 
-        # Cross-attention this token paid to the vision memory, meaned over
-        # layers and heads; index 0 is the CLS token, the rest is the 8x8 grid.
-        attention = torch.stack([
-            block.cross_attention.last_attention[0, :, pos, :]
-            for block in model.transformer_blocks
-        ]).float().mean(dim=(0, 1))                     # (layers, heads, 65) -> (65,)
-        patch_attention = (
-            attention[1:].reshape(PATCH_GRID, PATCH_GRID).cpu().numpy().astype(np.float32)
-        )
+                # Cross-attention this token paid to the vision memory, meaned over
+                # layers and heads; index 0 is the CLS token, the rest is the 8x8 grid.
+                attention = torch.stack([
+                    block.cross_attention.last_attention[0, :, pos, :]
+                    for block in model.transformer_blocks
+                ]).float().mean(dim=(0, 1))                     # (layers, heads, 65) -> (65,)
+                patch_attention = (
+                    attention[1:].reshape(PATCH_GRID, PATCH_GRID).cpu().numpy().astype(np.float32)
+                )
 
-        trace.append({
-            'word': tokenizer.idx_to_word[next_token],
-            'prob': float(probs[next_token]),
-            'top_k': [
-                (tokenizer.idx_to_word[int(idx)], float(p))
-                for p, idx in zip(top_probs.tolist(), top_indices.tolist())
-            ],
-            'attention': patch_attention,
-        })
+                trace.append({
+                    'word': tokenizer.idx_to_word[next_token],
+                    'prob': float(probs[next_token]),
+                    'top_k': [
+                        (tokenizer.idx_to_word[int(idx)], float(p))
+                        for p, idx in zip(top_probs.tolist(), top_indices.tolist())
+                    ],
+                    'attention': patch_attention,
+                })
 
-        input_tokens.append(next_token)
+            input_tokens.append(next_token)
 
-        if len(input_tokens) >= MAX_SEQ_LEN:
-            break
+            if len(input_tokens) >= MAX_SEQ_LEN:
+                break
+    finally:
+        for block in model.transformer_blocks:
+            block.cross_attention.store_attention = False
+            block.cross_attention.last_attention = None
 
     # Decode only the generated answer portion (skip BOS and question)
     response_tokens = input_tokens[len(q_tokens) + 1:]
@@ -409,6 +384,24 @@ def generate_response_traced(model, image, question, top_k=3):
 
 
 @torch.no_grad()
+def generate_response_traced(model, image, question, top_k=3):
+    """Greedy-generate a response, plus a per-token introspection trace.
+
+    Returns (response, trace). trace has one dict per generated token -- so its
+    entries line up 1:1 with the words of the returned response -- each with:
+      'word'      the chosen token's word
+      'prob'      that token's softmax probability
+      'top_k'     [(word, prob), ...] for the top_k tokens, descending
+      'attention' (8, 8) float32 cross-attention over the image patches,
+                  averaged across layers and heads (CLS column dropped)
+    """
+    return _generate(model, image, question, top_k=top_k, with_trace=True)
+
+
+@torch.no_grad()
 def generate_response(model, image, question):
-    """Greedy-generate a response for an image and question (interactive use only)."""
-    return generate_response_traced(model, image, question)[0]
+    """Greedy-generate a response for an image and question.
+
+    No introspection trace -- see generate_response_traced for that.
+    """
+    return _generate(model, image, question)[0]

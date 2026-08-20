@@ -176,13 +176,3 @@ class TextProcessor:
         else:
             tokens = tokens + [self.tokenizer.pad_token_id] * (MAX_SEQ_LEN - len(tokens))
         return tokens
-    
-    def clean_response(self, response: str) -> str:
-        """Clean up generated response text."""
-        # Remove extra spaces and normalize
-        response = ' '.join(response.split())
-        
-        # Ensure proper punctuation spacing
-        response = response.replace(' ?', '?').replace(' .', '.')
-        
-        return response.strip()
